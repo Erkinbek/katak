@@ -7,6 +7,9 @@ default-members = ["crates/katak-core", "crates/katak"]
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/Erkinbek/katak"
+homepage = "https://erkinbek.github.io/katak/"
 
 [workspace.dependencies]
 katak-core = { path = "crates/katak-core" }

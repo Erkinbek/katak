@@ -4,6 +4,12 @@ description = "Katak: a fast, non-freezing viewer/editor for huge CSV/TSV files"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["csv", "csv-viewer", "tsv", "large-files", "gui"]
+categories = ["gui", "text-processing", "visualization"]
 publish = false
 
 [[bin]]
