@@ -3,7 +3,6 @@ name = "katak-bench"
 description = "Measures Katak indexing/search/filter/save throughput on real files"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 publish = false
 
 [dependencies]
