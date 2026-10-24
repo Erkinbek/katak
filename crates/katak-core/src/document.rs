@@ -23,7 +23,7 @@ use crate::logical::{self, LKind, LPos, LRow};
 use crate::overlay::{ColRef, END, Overlay, RowRef};
 use crate::save::SaveInput;
 use crate::scan::{RecSpan, scan_all};
-use crate::source::{AccessMode, ChunkReader, Source};
+use crate::source::{self, AccessMode, ChunkReader, Source};
 use crate::units::{CR, LF, Units};
 use crate::with_units;
 
@@ -133,11 +133,14 @@ impl Document {
         let n = (source.len() as usize).min(SAMPLE_BYTES);
         let mut sample = vec![0u8; n];
         source.read_at(0, &mut sample)?;
+        source.prime(&sample);
+        source.enable_background_fetch(notify.clone());
         let whole = n as u64 == source.len();
         let detection = detect::detect(&sample, whole);
         let dialect = opts.dialect.unwrap_or_else(|| detection.dialect.clone());
         let compiled = Arc::new(dialect.compile()?);
-        let data_start = data_start_for(&source, &sample, &dialect)?;
+        let data_start =
+            source::with_blocking_reads(|| data_start_for(&source, &sample, &dialect))?;
         let index = Index::new(data_start, source.len());
         let mut doc = Document {
             locator: Locator::new(source.clone(), compiled.clone(), index.clone(), None, None),
@@ -169,7 +172,8 @@ impl Document {
     pub fn set_dialect(&mut self, dialect: Dialect) -> Result<(), OpenError> {
         let compiled = Arc::new(dialect.compile()?);
         self.overlay.clear();
-        self.data_start = data_start_for(&self.source, &self.sample, &dialect)?;
+        self.data_start =
+            source::with_blocking_reads(|| data_start_for(&self.source, &self.sample, &dialect))?;
         self.dialect = dialect;
         self.compiled = compiled;
         self.generation = next_generation();
@@ -227,6 +231,11 @@ impl Document {
         self.source.path()
     }
 
+    /// How the file was opened (mapped or buffered).
+    pub fn access(&self) -> AccessMode {
+        self.access
+    }
+
     pub fn source(&self) -> &Arc<Source> {
         &self.source
     }
@@ -271,6 +280,11 @@ impl Document {
 
     pub fn data_start(&self) -> u64 {
         self.data_start
+    }
+
+    /// When the file was (re)opened.
+    pub fn opened_at(&self) -> Instant {
+        self.opened
     }
 
     /// Time since the document was opened.
@@ -502,9 +516,13 @@ impl Document {
         let n = (source.len() as usize).min(SAMPLE_BYTES);
         let mut sample = vec![0u8; n];
         source.read_at(0, &mut sample)?;
-        self.data_start = data_start_for(&source, &sample, &self.dialect)?;
+        source.prime(&sample);
+        source.enable_background_fetch(self.notify.clone());
+        self.data_start =
+            source::with_blocking_reads(|| data_start_for(&source, &sample, &self.dialect))?;
         self.source = source;
         self.sample = sample.into();
+        self.opened = Instant::now();
         self.overlay.clear();
         self.generation = next_generation();
         self.restart_index();

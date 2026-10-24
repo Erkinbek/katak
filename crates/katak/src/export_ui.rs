@@ -74,6 +74,7 @@ impl ExportDialog {
             Delimiter::Char(',') => (Delim::Comma, String::new()),
             Delimiter::Char(';') => (Delim::Semicolon, String::new()),
             Delimiter::Char('\t') | Delimiter::Whitespace => (Delim::Tab, String::new()),
+            Delimiter::Lines => (Delim::Comma, String::new()),
             Delimiter::Char('|') => (Delim::Pipe, String::new()),
             Delimiter::Char(c) => (Delim::Other, c.to_string()),
             Delimiter::Str(s) => (Delim::Other, s.clone()),

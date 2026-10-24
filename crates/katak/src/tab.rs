@@ -103,13 +103,11 @@ pub struct Tab {
     pub save: Option<SaveJob>,
     /// Export (runs alongside editing; uses a snapshot of the edits).
     pub export: Option<SaveJob>,
+    /// "Keep this version" was chosen for this change on disk.
+    pub change_dismissed: Option<crate::watch::Change>,
 }
 
 impl Tab {
-    pub fn open(path: &Path, notify: Notify) -> Result<Tab, String> {
-        Self::open_with(path, OpenOptions::default(), notify)
-    }
-
     pub fn open_with(path: &Path, opts: OpenOptions, notify: Notify) -> Result<Tab, String> {
         let doc = Document::open(path, opts, notify)
             .map_err(|e| describe_open_error(path, &e.to_string()))?;
@@ -130,6 +128,7 @@ impl Tab {
             export_dialog: None,
             save: None,
             export: None,
+            change_dismissed: None,
         })
     }
 
@@ -240,7 +239,7 @@ impl Tab {
     pub fn retarget(&mut self, path: &Path, notify: Notify) -> Result<(), String> {
         let opts = OpenOptions {
             dialect: Some(self.doc.dialect().clone()),
-            ..OpenOptions::default()
+            access: self.doc.access(),
         };
         let doc = Document::open(path, opts, notify)
             .map_err(|e| describe_open_error(path, &e.to_string()))?;

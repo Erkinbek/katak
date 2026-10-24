@@ -66,6 +66,12 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
             _ => ui.label(format!("Col {}", col + 1)),
         };
         ui.label(format!("of {}", group(tab.info.columns as u64)));
+        if let Some(s) = &tab.info.selection {
+            sep(ui);
+            ui.label(selection_text(s)).on_hover_text(
+                "Selection: non-empty cells, and sum / average / min / max of the numbers in it",
+            );
+        }
         sep(ui);
         ui.label(format!("Delimiter {}", d.delimiter.label()))
             .on_hover_text("Parsing options: Ctrl+Shift+P");
@@ -154,6 +160,44 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
             }
         });
     });
+}
+
+fn selection_text(s: &crate::grid::SelStats) -> String {
+    let size = format!("{} × {}", group(s.rows), group(s.cols));
+    let Some(filled) = s.filled else {
+        return format!("Selected {size} (too large to summarize)");
+    };
+    let mut t = format!("Selected {size}: {} filled", group(filled));
+    if s.numbers > 0 {
+        t.push_str(&format!(
+            " · Sum {} · Avg {} · Min {} · Max {}",
+            number(s.sum),
+            number(s.sum / s.numbers as f64),
+            number(s.min),
+            number(s.max)
+        ));
+    }
+    t
+}
+
+/// Up to 4 decimals, thousands grouped, no trailing zeros.
+fn number(x: f64) -> String {
+    if !x.is_finite() {
+        return x.to_string();
+    }
+    let s = format!("{:.4}", x.abs());
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    let int = int
+        .parse::<u64>()
+        .map(group)
+        .unwrap_or_else(|_| int.to_string());
+    let sign = if x < 0.0 && s != "0" { "-" } else { "" };
+    if frac.is_empty() {
+        format!("{sign}{int}")
+    } else {
+        format!("{sign}{int}.{frac}")
+    }
 }
 
 fn ellipsize(s: &str, n: usize) -> String {

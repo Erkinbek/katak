@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "persistence", "clipboard", "accesskit"] }
 katak-core.workspace = true
+memmap2 = "0.9.12"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 

@@ -511,7 +511,9 @@ impl<'d> Scanner<'d> {
 
     #[inline]
     fn matches<U: Units>(buf: &[u8], full: usize, p: usize, pat: &[u32]) -> bool {
-        p + pat.len() * U::W <= full
+        // An empty pattern (no delimiter) never matches.
+        !pat.is_empty()
+            && p + pat.len() * U::W <= full
             && pat
                 .iter()
                 .enumerate()
@@ -1211,5 +1213,41 @@ mod tests {
                 String::from_utf8_lossy(&input)
             );
         }
+    }
+
+    #[test]
+    fn no_delimiter_gives_one_value_per_line() {
+        let raw = |encoding| {
+            Dialect {
+                delimiter: Delimiter::Lines,
+                quote: None,
+                has_header: false,
+                encoding,
+                ..Dialect::default()
+            }
+            .compile()
+            .unwrap()
+        };
+        let text = "a,b
+\"c
+d\"
+
+last";
+        let d = raw(TextEncoding::Utf8);
+        let recs = scan_all(&d, text.as_bytes(), 0, 100);
+        let lines: Vec<&str> = recs
+            .iter()
+            .map(|r| &text[r.start as usize..r.content_end as usize])
+            .collect();
+        assert_eq!(lines, ["a,b", "\"c", "d\"", "", "last"]);
+        assert!(recs.iter().all(|r| r.fields == 1));
+        let spans = crate::fields::split_all(&d, b"a,b;c	d");
+        assert_eq!(spans.len(), 1);
+        // The generic (UTF-16) path agrees.
+        let mut wide = Vec::new();
+        TextEncoding::Utf16Le.encode(text, &mut wide);
+        let recs16 = scan_all(&raw(TextEncoding::Utf16Le), &wide, 0, 100);
+        assert_eq!(recs16.len(), 5);
+        assert!(recs16.iter().all(|r| r.fields == 1));
     }
 }

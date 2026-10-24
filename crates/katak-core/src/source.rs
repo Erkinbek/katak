@@ -12,13 +12,22 @@
 //! access maps 16 MB views on demand and keeps a few of them; bulk scans
 //! read with `pread`/`ReadFile` into a reusable buffer, which is also faster
 //! than faulting pages in.
+//!
+//! A network share can take seconds to answer. On a thread that asked for
+//! non-blocking reads (the UI thread), a block of a buffered source that is
+//! not cached yet is fetched by a background thread and the read fails
+//! with [`io::ErrorKind::WouldBlock`]; the document's notify callback
+//! repaints when it arrives.
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io;
 use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::mpsc::{Sender, channel};
+use std::time::{Duration, Instant, SystemTime};
 
 use memmap2::{Mmap, MmapOptions};
 use parking_lot::Mutex;
@@ -33,6 +42,45 @@ pub enum AccessMode {
     Mapped,
     /// Never map.
     Buffered,
+}
+
+thread_local! {
+    static NONBLOCKING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes cache misses of buffered sources on this thread non-blocking
+/// (see the module docs). For the UI thread.
+pub fn set_nonblocking_reads(on: bool) {
+    NONBLOCKING.with(|c| c.set(on));
+}
+
+/// Runs `f` with blocking reads on this thread (opening a document needs
+/// its first bytes now).
+pub fn with_blocking_reads<T>(f: impl FnOnce() -> T) -> T {
+    let before = NONBLOCKING.with(|c| c.replace(false));
+    let out = f();
+    NONBLOCKING.with(|c| c.set(before));
+    out
+}
+
+/// The error only says "not loaded yet": try again after the next notify.
+pub fn is_pending(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::WouldBlock
+}
+
+fn pending() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "still loading from the drive")
+}
+
+/// After a failed background read, misses report that error for a while
+/// instead of queueing the same read again and again.
+const FAILURE_HOLD: Duration = Duration::from_secs(3);
+
+/// Background reader of a buffered source's blocks.
+struct Fetcher {
+    tx: Sender<u64>,
+    queued: Arc<Mutex<HashSet<u64>>>,
+    failed: Arc<Mutex<Option<(String, Instant)>>>,
 }
 
 const BLOCK: usize = 1 << 20;
@@ -105,6 +153,25 @@ impl<T: Clone> Lru<T> {
     }
 }
 
+/// Size and modification time of a file: a change means another program
+/// wrote it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    /// The current stamp of `path` (may block on a network drive).
+    pub fn of(path: &Path) -> io::Result<FileStamp> {
+        let m = std::fs::metadata(path)?;
+        Ok(FileStamp {
+            len: m.len(),
+            modified: m.modified().ok(),
+        })
+    }
+}
+
 /// An open, immutable view of a file's bytes as they were at open time.
 pub struct Source {
     path: PathBuf,
@@ -113,8 +180,9 @@ pub struct Source {
     file: File,
     mappable: bool,
     buffered_reason: Option<String>,
-    blocks: Mutex<Lru<Arc<[u8]>>>,
+    blocks: Arc<Mutex<Lru<Arc<[u8]>>>>,
     views: Mutex<Lru<Arc<Mmap>>>,
+    fetcher: Mutex<Option<Fetcher>>,
 }
 
 impl std::fmt::Debug for Source {
@@ -165,9 +233,107 @@ impl Source {
             file,
             mappable,
             buffered_reason,
-            blocks: Mutex::new(Lru::new(CACHE_BLOCKS)),
+            blocks: Arc::new(Mutex::new(Lru::new(CACHE_BLOCKS))),
             views: Mutex::new(Lru::new(CACHE_VIEWS)),
+            fetcher: Mutex::new(None),
         })
+    }
+
+    /// Lets non-blocking threads read this (buffered) source: misses are
+    /// fetched by a background thread, which calls `notify` per block.
+    /// Mapped sources never block on the network and need none.
+    pub fn enable_background_fetch(&self, notify: crate::job::Notify) {
+        if self.mappable || self.fetcher.lock().is_some() {
+            return;
+        }
+        let Ok(file) = self.file.try_clone() else {
+            return;
+        };
+        let (tx, rx) = channel::<u64>();
+        let queued = Arc::new(Mutex::new(HashSet::new()));
+        let failed = Arc::new(Mutex::new(None));
+        let (blocks, q, f, len) = (
+            self.blocks.clone(),
+            queued.clone(),
+            failed.clone(),
+            self.len,
+        );
+        // Testing aid: simulate a slow drive.
+        let delay = std::env::var("KATAK_TEST_READ_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis);
+        let spawned = std::thread::Builder::new()
+            .name("katak-fetch".into())
+            .spawn(move || {
+                // Ends when the source (and its sender) is dropped.
+                while let Ok(bi) = rx.recv() {
+                    if let Some(d) = delay {
+                        std::thread::sleep(d);
+                    }
+                    let start = bi * BLOCK as u64;
+                    let n = (BLOCK as u64).min(len.saturating_sub(start)) as usize;
+                    let mut data = vec![0u8; n];
+                    match read_full_at(&file, &mut data, start) {
+                        Ok(got) if got == n => blocks.lock().put(bi, data.into()),
+                        Ok(_) => {
+                            *f.lock() = Some((
+                                "the file became shorter while it was open".into(),
+                                Instant::now(),
+                            ))
+                        }
+                        Err(e) => *f.lock() = Some((e.to_string(), Instant::now())),
+                    }
+                    q.lock().remove(&bi);
+                    notify();
+                }
+            });
+        if spawned.is_ok() {
+            *self.fetcher.lock() = Some(Fetcher { tx, queued, failed });
+        }
+    }
+
+    /// Puts the first bytes of the file (already read, e.g. the detection
+    /// sample) into the block cache.
+    pub fn prime(&self, head: &[u8]) {
+        if self.mappable {
+            return;
+        }
+        let n = (BLOCK as u64).min(self.len) as usize;
+        if head.len() >= n {
+            self.blocks.lock().put(0, head[..n].to_vec().into());
+        }
+    }
+
+    /// On a non-blocking thread: queues the missing blocks among `range`
+    /// (plus one read-ahead) and returns the error to report, if any.
+    fn queue_missing(&self, range: std::ops::RangeInclusive<u64>) -> Option<io::Error> {
+        if !NONBLOCKING.with(Cell::get) {
+            return None;
+        }
+        let guard = self.fetcher.lock();
+        let f = guard.as_ref()?;
+        let last_block = self.len.saturating_sub(1) / BLOCK as u64;
+        let missing: Vec<u64> = {
+            let mut cache = self.blocks.lock();
+            range.filter(|&bi| cache.get(bi).is_none()).collect()
+        };
+        if missing.is_empty() {
+            return None;
+        }
+        if let Some((msg, at)) = f.failed.lock().clone()
+            && at.elapsed() < FAILURE_HOLD
+        {
+            return Some(io::Error::other(msg));
+        }
+        let ahead = missing.last().map(|&b| b + 1).filter(|&b| b <= last_block);
+        let mut queued = f.queued.lock();
+        for bi in missing.iter().copied().chain(ahead) {
+            if queued.insert(bi) {
+                let _ = f.tx.send(bi);
+            }
+        }
+        Some(pending())
     }
 
     pub fn path(&self) -> &Path {
@@ -186,6 +352,14 @@ impl Source {
     /// Modification time at open time.
     pub fn modified(&self) -> Option<SystemTime> {
         self.modified
+    }
+
+    /// Size and modification time at open time.
+    pub fn stamp(&self) -> FileStamp {
+        FileStamp {
+            len: self.len,
+            modified: self.modified,
+        }
     }
 
     /// Random access goes through memory-mapped views.
@@ -226,6 +400,11 @@ impl Source {
             if let Ok(b) = self.view_bytes(off, end) {
                 return Ok(b);
             }
+        }
+        if end > off
+            && let Some(e) = self.queue_missing(off / BLOCK as u64..=(end - 1) / BLOCK as u64)
+        {
+            return Err(e);
         }
         let mut out = Vec::with_capacity((end - off) as usize);
         let mut pos = off;
@@ -540,5 +719,41 @@ mod tests {
         let mut rd = ChunkReader::new(&src, 0, 1024);
         let w = rd.window(0).unwrap();
         assert!(w.eof && w.buf.is_empty());
+    }
+
+    #[test]
+    fn nonblocking_reads_load_in_the_background() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let data: Vec<u8> = (0..3_500_000u32).map(|i| (i % 253) as u8).collect();
+        let (_d, p) = temp_with(&data);
+        let src = Source::open(&p, AccessMode::Buffered).unwrap();
+        src.prime(&data[..1 << 20]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        src.enable_background_fetch(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        set_nonblocking_reads(true);
+        // The primed first block is there; the third is not.
+        assert_eq!(&*src.bytes(10, 20).unwrap(), &data[10..30]);
+        let err = src.bytes(2_500_000, 64).unwrap_err();
+        assert!(is_pending(&err), "{err}");
+        let t = Instant::now();
+        let got = loop {
+            match src.bytes(2_500_000, 64) {
+                Ok(b) => break b,
+                Err(e) if is_pending(&e) => {
+                    assert!(t.elapsed() < Duration::from_secs(10), "never arrived");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(&*got, &data[2_500_000..2_500_064]);
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        // Blocking reads on this thread are unaffected.
+        let far = with_blocking_reads(|| src.bytes(3_400_000, 16).unwrap());
+        assert_eq!(&*far, &data[3_400_000..3_400_016]);
+        set_nonblocking_reads(false);
     }
 }

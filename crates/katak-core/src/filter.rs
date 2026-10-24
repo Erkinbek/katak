@@ -198,7 +198,12 @@ pub fn start(
     let data = Arc::new(Mutex::new(FilterData::default()));
     let out = data.clone();
     let pre = prefilter(&filters, target.encoding);
-    let need = compiled.iter().map(|c| c.col + 1).max().unwrap_or(0);
+    // Only the filtered columns are split and decoded.
+    let need = compiled
+        .iter()
+        .map(|c| target.fields_for(c.col))
+        .max()
+        .unwrap_or(0);
     let job = Job::spawn("filter", notify, move |ctl| {
         let mut spans = Vec::new();
         let mut batch: Vec<Row> = Vec::new();
@@ -213,11 +218,6 @@ pub fn start(
             d.capped |= capped;
         };
         let forced = target.forced();
-        let need = if target.overlay.is_some() {
-            usize::MAX
-        } else {
-            need
-        };
         let res = visit_records(
             &target.src,
             &target.dialect,
@@ -233,10 +233,9 @@ pub fn start(
                 last_record = v.record;
                 spans.clear();
                 split(&target.dialect, v.content, 0, need, &mut spans);
-                let values = target.values(v.span.start, v.content, &spans);
                 let pass = compiled
                     .iter()
-                    .all(|c| c.matches(values.get(c.col).map_or("", |(_, v)| v.as_ref())));
+                    .all(|c| c.matches(&target.value(v.span.start, v.content, &spans, c.col)));
                 if pass {
                     matched += 1;
                     if kept < cap {

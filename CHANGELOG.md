@@ -4,6 +4,44 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-10-24 — Milestone 5: encodings, raw text, polish
+
+### Added
+
+- Raw text: the parsing dialog's preview can show the sample's characters
+  (tabs, line breaks, control characters as escapes; delimiter and quote
+  colored), and the "None: one value per line" delimiter
+  (`Delimiter::Lines`) opens a file as raw lines with every feature
+  working — every fixture round-trips byte for byte in that mode.
+- File → Reopen with encoding.
+- Changes on disk: a watcher thread notices when another program writes,
+  appends to or deletes an open file; a banner offers Reload (confirming
+  when there are unsaved edits) or "Keep this version".
+- Slow drives never block the window: buffered (network/removable)
+  sources load missing blocks on a background reader with read-ahead
+  while the grid keeps its rows and retries jumps; failed reads are
+  reported instead of retried in a loop. `--buffered` and
+  `KATAK_TEST_READ_DELAY_MS` simulate a network drive.
+- System fonts as fallbacks (memory-mapped, loaded after the first frame)
+  for CJK, Hangul, Indic scripts and symbols.
+- Selection summary in the status bar: size, filled cells, sum, average,
+  min and max (up to 20,000 cells, cached).
+
+### Fixed
+
+- Filters decoded every field up to the filtered column and allocated per
+  record since 0.3.0; the numeric range filter had fallen to ~450 MB/s.
+
+### Measured (Core Ultra 9 285, Windows 11, cached files)
+
+- 10 GB file read like a network drive with 150 ms per 1 MB block: UI
+  time per frame max 1.8 ms while scrolling and jumping.
+- 50 GB file while indexing: UI time per frame max 4.7 ms; first frame
+  with data 164 ms after process start; 131.5 MB private memory at exit.
+- Filters on 1 GB: numeric range 792 MB/s (was 444–458), equals /
+  contains 1.31–1.34 GB/s. Indexing 1.66–1.71 GB/s, whitespace preset
+  744–764 MB/s, search 1.30–1.38 GB/s (unchanged).
+
 ## [0.4.0] — 2026-10-24 — Milestone 4: replace, sort, export
 
 ### Added

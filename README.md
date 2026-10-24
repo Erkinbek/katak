@@ -21,7 +21,7 @@ The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | 2 | search and filter | **done** (v0.2.0) |
 | 3 | edit overlay, undo/redo, save with byte-identical round trip | **done** (v0.3.0) |
 | 4 | find/replace, sort, export conversions | **done** (v0.4.0) |
-| 5 | encodings, raw-text mode, polish | planned |
+| 5 | encodings, raw-text mode, polish | **done** (v0.5.0) |
 
 ## Features
 
@@ -55,7 +55,25 @@ The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   also makes Windows "Open with" work), light/dark theme, zoom, font size,
   monospace font.
 * Network and removable drives are read with buffered I/O instead of a
-  memory map, so a disconnected share produces an error, not a crash.
+  memory map, so a disconnected share produces an error, not a crash — and
+  in the background: the window never waits for a slow share; rows still
+  loading keep the previous picture until they arrive.
+* **Raw text**: the parsing dialog shows the file's characters as they are
+  (tabs, line breaks and control characters as escapes, delimiter and quote
+  colored), and "None: one value per line" opens the file as raw lines —
+  searchable, filterable, editable and saved byte for byte like any other
+  view.
+* **Encodings**: auto-detected, changeable in the parsing dialog or with
+  File → Reopen with encoding (UTF-8, UTF-16 LE/BE, Windows code pages,
+  ISO-8859-x, KOI8, Shift_JIS, EUC, GBK/GB18030, Big5, …); saving keeps
+  the file's encoding, Export converts.
+* **Changes on disk**: if another program changes, appends to or deletes an
+  open file, a banner offers to reload it (Katak keeps showing the version
+  it opened until then).
+* Text in any script: system fonts are added as fallbacks for CJK, Hangul,
+  Indic scripts and symbols.
+* The status bar summarizes a selection: size, filled cells and sum /
+  average / min / max of its numbers.
 * **Search** (Ctrl+F): plain text or regex, match case (with Unicode case
   folding), whole word, whole cell, current column only. Runs in the
   background with a live counter; F3 / Shift+F3 work before it finishes;
@@ -120,7 +138,7 @@ The binary is `target/release/katak` (`katak.exe` on Windows).
   default) with the "Desktop development with C++" build tools. The
   resulting `katak.exe` is portable. The optional installer is built with
   [Inno Setup](https://jrsoftware.org/isinfo.php):
-  `ISCC.exe /DAppVersion=0.4.0 packaging\windows\katak.iss`.
+  `ISCC.exe /DAppVersion=0.5.0 packaging\windows\katak.iss`.
 * **Linux**: install the X11/Wayland headers egui needs, e.g. on Debian or
   Ubuntu `sudo apt install libxcb-render0-dev libxcb-shape0-dev
   libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev`. File dialogs use
@@ -197,7 +215,7 @@ files in the OS cache, release build. Files come from `tools/katak-gen`.
 | Literal search, 1 GB / 10 GB file | ≥ 500 MB/s | **1.27–1.37 GB/s / 0.95–1.0 GB/s** |
 | Case-insensitive literal search, 1 GB | ≥ 500 MB/s | **809 MB/s** |
 | Regex search, 1 GB / 10 GB | ≥ 200 MB/s | **1.14–1.31 GB/s / 975 MB/s** |
-| Filter (literal / numeric range), 1 GB | ≥ 500 MB/s | **1.17–1.28 GB/s / 810 MB/s** |
+| Filter (literal / numeric range), 1 GB | ≥ 500 MB/s | **1.31–1.34 GB/s / 792 MB/s** |
 | Filter (literal / numeric range), 10 GB | ≥ 500 MB/s | **1.17–1.23 GB/s / 771 MB/s** |
 | UI frame time with highlighting / filtered view | < 16 ms | **max 4.6 ms / 9.0 ms** |
 | Save, zero edits (10 GB) | byte-identical | **identical, 1.54 GB/s** |
@@ -206,6 +224,8 @@ files in the OS cache, release build. Files come from `tools/katak-gen`.
 | Sort 12 M rows (1 GB): numbers / few-valued text / all-distinct text | default 512 MB budget | **1.19 s / 1.59 s / 3.8 s**, 414 MB peak |
 | Sort 119 M rows (10 GB), 8 GB budget: numbers / text | bounded memory | **14.1 s / 15.1 s**, 3.6 GB peak (refused at 512 MB with the size needed) |
 | UI time per frame in a sorted 12 M-row view | < 16 ms | **max 3.7 ms** |
+| UI time per frame, 10 GB file read like a network drive with 150 ms per 1 MB block | never blocks | **max 1.8 ms** (frame interval max 17 ms) |
+| UI time per frame, 50 GB file while indexing (scroll, scrollbar jumps, go to row) | < 16 ms | **max 4.7 ms** |
 | Export to TSV + CRLF, 1 GB / 10 GB | streaming | **355–362 MB/s / 356–400 MB/s**, 53 MB peak |
 | Export in sort order, 1 GB / 10 GB | no random reads | **7.0 s / 72 s** |
 | Replace all as a streaming rewrite (~10 % of rows), 10 GB | streaming | **349–399 MB/s**, 62 MB peak |
@@ -216,6 +236,7 @@ Reproduce with:
 cargo run --release -p katak-gen                       # writes testdata/generated/ (~12 GB)
 cargo run --release -p katak-bench -- testdata/generated/big_10g.csv --suite --save --convert
 target/release/katak testdata/generated/big_10g.csv --perf perf.log --self-test
+KATAK_TEST_READ_DELAY_MS=150 target/release/katak testdata/generated/big_10g.csv --buffered --perf perf.log --self-test
 ```
 
 `--self-test` opens the file, scrolls vertically, jumps with the scrollbar,
