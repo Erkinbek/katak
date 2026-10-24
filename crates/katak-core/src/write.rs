@@ -102,7 +102,7 @@ impl Writer {
         if !v.bytes().any(|b| self.special[b as usize]) {
             return false;
         }
-        v.contains(self.delim_text.as_str())
+        (!self.delim_text.is_empty() && v.contains(self.delim_text.as_str()))
             || v.contains(self.quote)
             || v.contains(['\r', '\n'])
             || (self.escape == Escape::Backslash && v.contains('\\'))

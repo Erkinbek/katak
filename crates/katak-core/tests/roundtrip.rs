@@ -101,3 +101,53 @@ fn an_edit_changes_only_its_record() {
         );
     }
 }
+
+/// The raw-text view (no delimiter, no quotes) also round-trips, and an
+/// edited line is written back without touching its neighbours.
+#[test]
+fn raw_lines_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    for f in fixtures() {
+        let original = fs::read(&f).unwrap();
+        let path = tmp.path().join(f.file_name().unwrap());
+        fs::write(&path, &original).unwrap();
+        let detected = open(&path).dialect().clone();
+        let raw = katak_core::dialect::Dialect {
+            delimiter: katak_core::dialect::Delimiter::Lines,
+            quote: None,
+            has_header: false,
+            ..detected
+        };
+        let opts = OpenOptions {
+            dialect: Some(raw),
+            ..OpenOptions::default()
+        };
+        let mut doc = Document::open(&path, opts, no_notify()).unwrap();
+        if let Some(j) = doc.index_job() {
+            j.join();
+        }
+        let out = tmp.path().join("copy");
+        save_to(&doc, &out);
+        assert_eq!(fs::read(&out).unwrap(), original, "{}", f.display());
+        let first = doc.first_lpos();
+        let Ok((rows, _)) = doc.lrows_from(first, 1) else {
+            continue;
+        };
+        let Some(row) = rows.first().copied() else {
+            continue;
+        };
+        let LKind::Src(span) = row.kind else { continue };
+        doc.set_values(vec![(row.row_ref(), 0, "a whole new line".into())]);
+        save_to(&doc, &out);
+        let saved = fs::read(&out).unwrap();
+        assert_eq!(
+            &saved[..span.start as usize],
+            &original[..span.start as usize]
+        );
+        assert!(
+            saved.ends_with(&original[span.content_end as usize..]),
+            "{}",
+            f.display()
+        );
+    }
+}

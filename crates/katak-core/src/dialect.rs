@@ -14,10 +14,14 @@ pub enum Delimiter {
     Str(String),
     /// Any run of spaces and tabs; leading and trailing blanks are ignored.
     Whitespace,
+    /// No delimiter: every record is one value (with no quote character,
+    /// every line — the raw-text view).
+    Lines,
 }
 
 impl Delimiter {
-    /// Short human-readable label (`,`, `Tab`, `Space`, `||`, `Whitespace`).
+    /// Short human-readable label (`,`, `Tab`, `Space`, `||`, `Whitespace`,
+    /// `None`).
     pub fn label(&self) -> String {
         match self {
             Delimiter::Char('\t') => "Tab".into(),
@@ -25,15 +29,18 @@ impl Delimiter {
             Delimiter::Char(c) => c.to_string(),
             Delimiter::Str(s) => s.clone(),
             Delimiter::Whitespace => "Whitespace".into(),
+            Delimiter::Lines => "None".into(),
         }
     }
 
-    /// The literal text inserted between fields when writing.
+    /// The literal text inserted between fields when writing (empty for
+    /// [`Delimiter::Lines`], which has one field per record).
     pub fn write_str(&self) -> String {
         match self {
             Delimiter::Char(c) => c.to_string(),
             Delimiter::Str(s) => s.clone(),
             Delimiter::Whitespace => " ".into(),
+            Delimiter::Lines => String::new(),
         }
     }
 }
@@ -156,6 +163,7 @@ impl Dialect {
         };
         let (delim, whitespace) = match &self.delimiter {
             Delimiter::Whitespace => (Vec::new(), true),
+            Delimiter::Lines => (Vec::new(), false),
             Delimiter::Char(c) => (units(c.encode_utf8(&mut [0u8; 4])), false),
             Delimiter::Str(s) if s.is_empty() => return Err(DialectError::EmptyDelimiter),
             Delimiter::Str(s) => (units(s), false),
