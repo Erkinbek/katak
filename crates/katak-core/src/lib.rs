@@ -4,19 +4,23 @@
 //! memory-mapped (or read in chunks), a background job builds a sparse
 //! quote-aware checkpoint index, and every UI-side operation is bounded.
 
+pub mod chunked;
 pub mod detect;
 pub mod dialect;
 pub mod document;
 pub mod encoding;
 pub mod fields;
+pub mod filter;
 pub mod index;
 pub mod infer;
 pub mod job;
 pub mod locate;
 pub mod scan;
+pub mod search;
 pub mod source;
 pub mod sys;
 pub mod units;
+pub mod visit;
 
 pub use dialect::{Compiled, Delimiter, Dialect, DialectError, Escape};
 pub use encoding::TextEncoding;

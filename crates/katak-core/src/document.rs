@@ -260,6 +260,17 @@ impl Document {
         self.opened.elapsed()
     }
 
+    /// What background jobs (search, filter) need to scan this document.
+    pub fn target(&self) -> crate::search::Target {
+        crate::search::Target {
+            src: self.source.clone(),
+            dialect: self.compiled.clone(),
+            encoding: self.dialect.encoding,
+            data_start: self.data_start,
+            header_records: self.header_records(),
+        }
+    }
+
     /// Records before the first data row (1 with a header row, else 0).
     pub fn header_records(&self) -> u64 {
         self.dialect.has_header as u64

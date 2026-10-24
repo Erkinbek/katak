@@ -30,6 +30,8 @@ pub struct Tab {
     pub info: GridInfo,
     pub first_paint: Option<f64>,
     pub banner_dismissed: bool,
+    pub search: crate::search_ui::SearchBar,
+    pub filter: crate::filter_ui::FilterBar,
 }
 
 impl Tab {
@@ -50,6 +52,8 @@ impl Tab {
             info: GridInfo::default(),
             first_paint: None,
             banner_dismissed: false,
+            search: Default::default(),
+            filter: Default::default(),
         })
     }
 

@@ -10,10 +10,15 @@ use eframe::egui::{
     Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use eframe::epaint::text::{LayoutJob, TextFormat, TextWrapping};
+use std::ops::Range;
+use std::sync::Arc;
+
 use katak_core::document::{Cell, Document};
+use katak_core::filter::{Row, SharedFilter};
 use katak_core::infer::{self, ColumnType};
 use katak_core::locate::{FetchEnd, RowPos};
 use katak_core::scan::RecSpan;
+use katak_core::search::Matcher;
 
 use crate::theme::GridColors;
 
@@ -125,6 +130,18 @@ pub struct GridInfo {
     pub loading: bool,
     pub double_clicked: Option<(RecSpan, usize)>,
     pub painted_rows: usize,
+    /// "Filter this column" was chosen in the header menu.
+    pub filter_column: Option<usize>,
+}
+
+/// Which rows the grid shows.
+#[derive(Clone, Default)]
+pub enum View {
+    /// Every record in file order.
+    #[default]
+    Natural,
+    /// The rows of a (possibly still running) filter, in file order.
+    List(SharedFilter),
 }
 
 /// Per-tab grid state.
@@ -150,6 +167,13 @@ pub struct Grid {
     header_names: Vec<(usize, String)>,
     /// Column the context menu was opened for.
     menu_col: Option<usize>,
+    view: View,
+    /// First visible list index and cursor list index (list view only).
+    ltop: usize,
+    lcur: usize,
+    /// Search matches are highlighted in visible cells.
+    pub highlight: Option<Arc<Matcher>>,
+    filter_request: Option<usize>,
 }
 
 impl Grid {
@@ -180,6 +204,47 @@ impl Grid {
             monospace: false,
             header_names: Vec::new(),
             menu_col: None,
+            view: View::Natural,
+            ltop: 0,
+            lcur: 0,
+            highlight: None,
+            filter_request: None,
+        }
+    }
+
+    /// Switches between all rows and a filtered list. The cursor moves to
+    /// the nearest listed row.
+    pub fn set_view(&mut self, view: View) {
+        let cursor = self.cursor;
+        self.view = view;
+        self.top_px = 0.0;
+        self.anchor = None;
+        self.ltop = 0;
+        self.lcur = 0;
+        if let Some(l) = self.list() {
+            let d = l.lock();
+            if !d.rows.is_empty() {
+                self.lcur = d
+                    .rows
+                    .partition_point(|r| r.offset < cursor.offset)
+                    .min(d.rows.len() - 1);
+                self.ltop = self.lcur;
+                self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
+                self.top = self.cursor;
+            }
+        } else {
+            self.top = cursor;
+        }
+    }
+
+    pub fn is_list(&self) -> bool {
+        matches!(self.view, View::List(_))
+    }
+
+    fn list(&self) -> Option<SharedFilter> {
+        match &self.view {
+            View::List(l) => Some(l.clone()),
+            View::Natural => None,
         }
     }
 
@@ -242,6 +307,9 @@ impl Grid {
     }
 
     fn clamp_top(&mut self, doc: &mut Document) {
+        if self.is_list() {
+            return;
+        }
         if self.top.record < Self::header_records(doc) {
             if let Ok(p) = doc.first_data_row() {
                 self.top = p;
@@ -251,6 +319,14 @@ impl Grid {
     }
 
     fn move_top(&mut self, doc: &mut Document, delta: i64) {
+        if let Some(l) = self.list() {
+            let d = l.lock();
+            if !d.rows.is_empty() {
+                self.ltop = (self.ltop as i64 + delta).clamp(0, d.rows.len() as i64 - 1) as usize;
+                self.top = list_pos(d.rows.get(self.ltop).unwrap_or_default());
+            }
+            return;
+        }
         if delta > 0 {
             if let Ok(f) = doc.locator().records_from(self.top, delta as usize + 1)
                 && let Some(last) = f.rows.get(delta as usize).or(f.rows.last())
@@ -267,6 +343,14 @@ impl Grid {
     }
 
     fn move_cursor(&mut self, doc: &mut Document, delta: i64) {
+        if let Some(l) = self.list() {
+            let d = l.lock();
+            if !d.rows.is_empty() {
+                self.lcur = (self.lcur as i64 + delta).clamp(0, d.rows.len() as i64 - 1) as usize;
+                self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
+            }
+            return;
+        }
         let hdr = Self::header_records(doc);
         if delta > 0 {
             if let Ok(f) = doc.locator().records_from(self.cursor, delta as usize + 1)
@@ -284,6 +368,20 @@ impl Grid {
     }
 
     fn goto(&mut self, doc: &mut Document, pos: RowPos, visible: usize) {
+        if let Some(l) = self.list() {
+            let d = l.lock();
+            if !d.rows.is_empty() {
+                self.lcur = d
+                    .rows
+                    .partition_point(|r| r.offset < pos.offset)
+                    .min(d.rows.len() - 1);
+                self.ltop = self.lcur.saturating_sub(visible / 3);
+                self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
+                self.top = list_pos(d.rows.get(self.ltop).unwrap_or_default());
+                self.top_px = 0.0;
+            }
+            return;
+        }
         self.cursor = pos;
         // Keep a little context above the target.
         self.top = pos;
@@ -293,6 +391,18 @@ impl Grid {
     }
 
     fn ensure_cursor_visible(&mut self, doc: &mut Document, visible: usize) {
+        if let Some(l) = self.list() {
+            let full = visible.saturating_sub(1).max(1);
+            if self.lcur < self.ltop {
+                self.ltop = self.lcur;
+            } else if self.lcur >= self.ltop + full {
+                self.ltop = self.lcur + 1 - full;
+            }
+            if let Some(r) = l.lock().rows.get(self.ltop) {
+                self.top = list_pos(r);
+            }
+            return;
+        }
         if self.cursor.offset < self.top.offset {
             self.top = self.cursor;
             self.top_px = 0.0;
@@ -312,6 +422,9 @@ impl Grid {
     fn apply_commands(&mut self, doc: &mut Document, row_h: f32, visible: usize, view_w: f32) {
         let cmds = std::mem::take(&mut self.commands);
         for c in cmds {
+            if self.is_list() && self.list_command(doc, c, visible) {
+                continue;
+            }
             match c {
                 GridCommand::GotoRow(n) => {
                     let hdr = Self::header_records(doc);
@@ -381,6 +494,87 @@ impl Grid {
             0.0,
             (total_w - frozen_w - (view_w - frozen_w) * 0.5).max(0.0),
         );
+    }
+
+    /// Handles position commands in list view; false for the others.
+    fn list_command(&mut self, doc: &mut Document, c: GridCommand, visible: usize) -> bool {
+        let Some(l) = self.list() else { return false };
+        let n = l.lock().rows.len();
+        if n == 0 {
+            return matches!(
+                c,
+                GridCommand::GotoRow(_)
+                    | GridCommand::GotoOffset(_)
+                    | GridCommand::GotoRecord(_)
+                    | GridCommand::Top
+                    | GridCommand::Bottom
+                    | GridCommand::JumpFraction(_)
+            );
+        }
+        let page = visible.saturating_sub(1).max(1);
+        let (top, cur) = match c {
+            GridCommand::GotoRow(row) => {
+                let rec = row + Self::header_records(doc);
+                let i = l.lock().rows.partition_point(|r| r.record < rec).min(n - 1);
+                (i.saturating_sub(visible / 3), i)
+            }
+            GridCommand::GotoOffset(off) => {
+                let i = l.lock().rows.partition_point(|r| r.offset < off).min(n - 1);
+                (i.saturating_sub(visible / 3), i)
+            }
+            GridCommand::GotoRecord(p) => {
+                let i = l
+                    .lock()
+                    .rows
+                    .partition_point(|r| r.offset < p.offset)
+                    .min(n - 1);
+                (i.saturating_sub(visible / 3), i)
+            }
+            GridCommand::Top => (0, 0),
+            GridCommand::Bottom => (n.saturating_sub(page), n - 1),
+            GridCommand::JumpFraction(f) => {
+                let i =
+                    ((n as f64 * f.clamp(0.0, 1.0) as f64) as usize).min(n.saturating_sub(page));
+                (i, self.lcur)
+            }
+            _ => return false,
+        };
+        let d = l.lock();
+        self.ltop = top.min(n - 1);
+        self.lcur = cur.min(n - 1);
+        self.top = list_pos(d.rows.get(self.ltop).unwrap_or_default());
+        self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
+        self.top_px = 0.0;
+        true
+    }
+
+    /// Rows `[ltop, ltop + n)` of the list view with their extents.
+    fn fetch_list(
+        &mut self,
+        doc: &mut Document,
+        l: &SharedFilter,
+        n: usize,
+    ) -> Vec<(RowPos, RecSpan)> {
+        let picked: Vec<Row> = {
+            let d = l.lock();
+            if d.rows.is_empty() {
+                return Vec::new();
+            }
+            self.ltop = self.ltop.min(d.rows.len() - 1);
+            self.lcur = self.lcur.min(d.rows.len() - 1);
+            d.rows.slice(self.ltop, self.ltop + n)
+        };
+        picked
+            .into_iter()
+            .filter_map(|r| {
+                let pos = list_pos(r);
+                let f = doc.locator().records_from(pos, 1).ok()?;
+                f.rows
+                    .into_iter()
+                    .next()
+                    .filter(|(p, _)| p.offset == pos.offset)
+            })
+            .collect()
     }
 
     /// Shows the last page; returns the last row.
@@ -485,16 +679,27 @@ impl Grid {
         }
 
         // Fetch visible rows.
-        let fetched = doc.locator().records_from(self.top, visible);
-        let (rows, loading) = match fetched {
-            Ok(f) => {
-                let loading = f.end == FetchEnd::Budget;
-                (f.rows, loading)
+        let (rows, loading) = if let Some(l) = self.list() {
+            let len = l.lock().rows.len();
+            if len > 0 && self.ltop + visible > len + 1 {
+                self.ltop = len.saturating_sub(visible.saturating_sub(1));
             }
-            Err(_) => (Vec::new(), false),
+            (self.fetch_list(doc, &l, visible), false)
+        } else {
+            match doc.locator().records_from(self.top, visible) {
+                Ok(f) => {
+                    let loading = f.end == FetchEnd::Budget;
+                    (f.rows, loading)
+                }
+                Err(_) => (Vec::new(), false),
+            }
         };
         // Do not leave empty space at the end of the file.
-        if rows.len() + 1 < visible && !loading && self.top.record > Self::header_records(doc) {
+        if !self.is_list()
+            && rows.len() + 1 < visible
+            && !loading
+            && self.top.record > Self::header_records(doc)
+        {
             let missing = (visible - 1 - rows.len()) as i64;
             let before = self.top;
             self.move_top(doc, -missing);
@@ -536,6 +741,13 @@ impl Grid {
         let hdr = Self::header_records(doc);
         let sel = self.selection();
         let char_px = font_size * 0.5;
+        // Alternate by visual row: list views skip records.
+        let first_visual = if self.is_list() {
+            self.ltop
+        } else {
+            self.top.record.saturating_sub(hdr) as usize
+        };
+        let stripe = |ri: usize| (first_visual + ri) % 2 == 1;
 
         // Rows.
         let cell_painter = painter.with_clip_rect(cells_rect);
@@ -546,7 +758,7 @@ impl Grid {
             let row_rect =
                 Rect::from_min_size(pos2(cells_rect.left(), y), vec2(cells_rect.width(), row_h));
             let ragged = expected.is_some_and(|e| rec.fields != 0 && rec.fields != e);
-            if (pos.record - hdr) % 2 == 1 {
+            if stripe(ri) {
                 cell_painter.rect_filled(row_rect, CornerRadius::ZERO, colors.stripe);
             }
             if ragged {
@@ -574,7 +786,7 @@ impl Grid {
                         cell_painter.rect_filled(
                             rect,
                             CornerRadius::ZERO,
-                            if (pos.record - hdr) % 2 == 1 {
+                            if stripe(ri) {
                                 colors.stripe
                             } else {
                                 colors.background
@@ -592,6 +804,12 @@ impl Grid {
                     {
                         cell_painter.rect_filled(rect, CornerRadius::ZERO, colors.selection);
                     }
+                    let marks = match &self.highlight {
+                        Some(m) if m.wants_column(c) && !cell.text.is_empty() => {
+                            m.ranges(&cell.text, 16)
+                        }
+                        _ => Vec::new(),
+                    };
                     self.paint_cell(
                         &cell_painter,
                         rect,
@@ -599,6 +817,7 @@ impl Grid {
                         &font,
                         colors,
                         self.cols.kind(c).is_numeric(),
+                        &marks,
                     );
                     if pointer.is_some_and(|p| rect.contains(p) && cells_rect.contains(p)) {
                         hovered = Some((ri, c));
@@ -831,12 +1050,17 @@ impl Grid {
         info.cursor = Some(self.cursor);
         info.cursor_col = self.cursor_col;
         info.columns = ncols;
+        info.filter_column = self.filter_request.take();
         info
     }
 
     fn column_menu(&mut self, ui: &mut Ui, c: usize, name: &str) {
         ui.strong(format!("Column {}: {}", c + 1, name));
         ui.separator();
+        if ui.button("Filter this column…").clicked() {
+            self.filter_request = Some(c);
+            ui.close();
+        }
         if ui.button("Auto-fit width").clicked() {
             self.commands.push(GridCommand::AutoFit(c));
             ui.close();
@@ -868,6 +1092,7 @@ impl Grid {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_cell(
         &self,
         painter: &egui::Painter,
@@ -876,6 +1101,7 @@ impl Grid {
         font: &FontId,
         colors: &GridColors,
         numeric: bool,
+        marks: &[Range<usize>],
     ) {
         if cell.missing {
             return;
@@ -892,7 +1118,11 @@ impl Grid {
         if avail <= 2.0 {
             return;
         }
-        let job = single_line(&text, font.clone(), color, avail);
+        let job = if marks.is_empty() {
+            single_line(&text, font.clone(), color, avail)
+        } else {
+            highlighted_line(&text, marks, font.clone(), color, colors.highlight, avail)
+        };
         let galley = painter.layout_job(job);
         let y = rect.center().y - galley.size().y * 0.5;
         let x = if numeric {
@@ -1124,12 +1354,24 @@ impl Grid {
             doc.source().len().max(doc.data_start() + 1),
         );
         let span = (b - a) as f64;
-        let frac = ((self.top.offset.saturating_sub(a)) as f64 / span).clamp(0.0, 1.0) as f32;
-        let shown = self
-            .rows
-            .last()
-            .map_or(0, |r| r.1.end.saturating_sub(self.top.offset));
-        let thumb_frac = (shown as f64 / span).clamp(0.0, 1.0) as f32;
+        let (frac, thumb_frac) = match self.list() {
+            Some(l) => {
+                let n = l.lock().rows.len().max(1) as f32;
+                (
+                    (self.ltop as f32 / n).clamp(0.0, 1.0),
+                    (self.rows.len() as f32 / n).clamp(0.0, 1.0),
+                )
+            }
+            None => {
+                let frac =
+                    ((self.top.offset.saturating_sub(a)) as f64 / span).clamp(0.0, 1.0) as f32;
+                let shown = self
+                    .rows
+                    .last()
+                    .map_or(0, |r| r.1.end.saturating_sub(self.top.offset));
+                (frac, (shown as f64 / span).clamp(0.0, 1.0) as f32)
+            }
+        };
         let thumb_h = (track.height() * thumb_frac).max(24.0).min(track.height());
         let travel = (track.height() - thumb_h).max(1.0);
         let thumb = Rect::from_min_size(
@@ -1280,6 +1522,50 @@ pub fn single_line(text: &str, font: FontId, color: Color32, max_width: f32) -> 
     };
     job.break_on_newline = false;
     job
+}
+
+/// Like [`single_line`], with `marks` (byte ranges of `text`) highlighted.
+pub fn highlighted_line(
+    text: &str,
+    marks: &[Range<usize>],
+    font: FontId,
+    color: Color32,
+    bg: Color32,
+    max_width: f32,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let plain = TextFormat::simple(font.clone(), color);
+    let mark = TextFormat {
+        background: bg,
+        ..TextFormat::simple(font, color)
+    };
+    let mut at = 0;
+    for r in marks {
+        let (a, b) = (r.start.min(text.len()), r.end.min(text.len()));
+        if a < at || !text.is_char_boundary(a) || !text.is_char_boundary(b) {
+            continue;
+        }
+        job.append(&text[at..a], 0.0, plain.clone());
+        job.append(&text[a..b], 0.0, mark.clone());
+        at = b;
+    }
+    job.append(&text[at..], 0.0, plain);
+    job.wrap = TextWrapping {
+        max_width: max_width.max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    job.break_on_newline = false;
+    job
+}
+
+fn list_pos(r: Row) -> RowPos {
+    RowPos {
+        offset: r.offset,
+        record: r.record,
+        exact: true,
+    }
 }
 
 /// `1234567` -> `1,234,567`.

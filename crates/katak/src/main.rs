@@ -15,9 +15,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod filter_ui;
 mod grid;
 mod parse_dialog;
 mod perf;
+mod search_ui;
 mod status;
 mod tab;
 mod theme;

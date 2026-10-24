@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use katak_core::document::{Document, OpenOptions};
+use katak_core::filter::{self, ColumnFilter, FilterOp};
 use katak_core::job::no_notify;
+use katak_core::search::{self, SearchOptions, Target};
 use katak_core::source::AccessMode;
 use katak_core::sys::{human_bytes, private_bytes};
 
@@ -20,6 +22,8 @@ struct Args {
     files: Vec<PathBuf>,
     access: AccessMode,
     repeat: usize,
+    /// Run the search/filter suite (patterns suit the generated big_*.csv).
+    suite: bool,
 }
 
 fn parse_args() -> Args {
@@ -27,17 +31,19 @@ fn parse_args() -> Args {
         files: Vec::new(),
         access: AccessMode::Auto,
         repeat: 1,
+        suite: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--buffered" => args.access = AccessMode::Buffered,
             "--repeat" => args.repeat = it.next().and_then(|n| n.parse().ok()).unwrap_or(1),
+            "--suite" => args.suite = true,
             _ => args.files.push(PathBuf::from(a)),
         }
     }
     if args.files.is_empty() {
-        eprintln!("usage: katak-bench FILE... [--buffered] [--repeat N]");
+        eprintln!("usage: katak-bench FILE... [--buffered] [--repeat N] [--suite]");
         std::process::exit(2);
     }
     args
@@ -57,7 +63,11 @@ fn mem() -> String {
         .unwrap_or_else(|| "n/a".into())
 }
 
-fn bench(path: &PathBuf, access: AccessMode) -> Result<(), Box<dyn std::error::Error>> {
+fn bench(
+    path: &PathBuf,
+    access: AccessMode,
+    suite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let len = std::fs::metadata(path)?.len();
     println!("\n== {} ({})", path.display(), human_bytes(len));
     println!("   private memory before open: {}", mem());
@@ -146,6 +156,119 @@ fn bench(path: &PathBuf, access: AccessMode) -> Result<(), Box<dyn std::error::E
         ms(worst)
     );
     println!("   private memory with file open and indexed: {}", mem());
+    if suite {
+        search_suite(&mut doc)?;
+    }
+    Ok(())
+}
+
+/// Search and filter throughput on the generated big_*.csv layout
+/// (id,name,email,amount,date,city,notes).
+fn search_suite(doc: &mut Document) -> Result<(), Box<dyn std::error::Error>> {
+    let target = Target {
+        src: doc.source().clone(),
+        dialect: doc.compiled().clone(),
+        encoding: doc.dialect().encoding,
+        data_start: doc.data_start(),
+        header_records: doc.header_records(),
+    };
+    let len = doc.source().len();
+    let lit = |p: &str| SearchOptions {
+        pattern: p.into(),
+        case_sensitive: true,
+        ..SearchOptions::default()
+    };
+    let cases: Vec<(&str, SearchOptions)> = vec![
+        ("literal, absent", lit("zulu")),
+        ("literal, rare", lit("foxtrot foxtrot 7")),
+        ("literal, ~10% of rows", lit("Samarkand")),
+        (
+            "literal, case-insensitive",
+            SearchOptions {
+                case_sensitive: false,
+                ..lit("SAMARKAND")
+            },
+        ),
+        (
+            "regex, dates 1999-12-0x",
+            SearchOptions {
+                regex: true,
+                ..lit(r"1999-12-0\d")
+            },
+        ),
+        (
+            "regex, whole word",
+            SearchOptions {
+                regex: true,
+                whole_word: true,
+                ..lit("juliet")
+            },
+        ),
+        (
+            "literal in column 6 only",
+            SearchOptions {
+                columns: Some(vec![5]),
+                ..lit("Samarkand")
+            },
+        ),
+    ];
+    for (name, o) in cases {
+        let t = Instant::now();
+        let s = search::start(target.clone(), o, search::DEFAULT_CAP, no_notify())
+            .map_err(|e| e.to_string())?;
+        s.job.join();
+        let took = t.elapsed();
+        let (done, _) = s.job.progress();
+        let d = s.data.lock();
+        println!(
+            "   search {name}: {} hits{} in {:.0} ms = {:.0} MB/s",
+            d.hits.len(),
+            if d.capped { " (capped)" } else { "" },
+            ms(took),
+            mb_per_s(if d.capped || !d.done { done } else { len }, took)
+        );
+    }
+    let f = |col: usize, op: FilterOp| ColumnFilter {
+        col,
+        op,
+        case_sensitive: true,
+    };
+    let filters: Vec<(&str, Vec<ColumnFilter>)> = vec![
+        (
+            "city equals Samarkand",
+            vec![f(5, FilterOp::Equals("Samarkand".into()))],
+        ),
+        (
+            "name contains Lee",
+            vec![f(1, FilterOp::Contains("Lee".into()))],
+        ),
+        (
+            "amount between 1000 and 2000",
+            vec![f(3, FilterOp::Range(Some(1000.0), Some(2000.0)))],
+        ),
+        (
+            "city = Samarkand AND amount < 500",
+            vec![
+                f(5, FilterOp::Equals("Samarkand".into())),
+                f(3, FilterOp::Range(None, Some(500.0))),
+            ],
+        ),
+    ];
+    for (name, fs) in filters {
+        let t = Instant::now();
+        let r = filter::start(target.clone(), fs, filter::DEFAULT_CAP, no_notify())
+            .map_err(|e| e.to_string())?;
+        r.job.join();
+        let took = t.elapsed();
+        let d = r.data.lock();
+        println!(
+            "   filter {name}: {} rows{} in {:.0} ms = {:.0} MB/s",
+            d.matched,
+            if d.capped { " (list capped)" } else { "" },
+            ms(took),
+            mb_per_s(len, took)
+        );
+    }
     Ok(())
 }
 
@@ -153,7 +276,7 @@ fn main() {
     let args = parse_args();
     for _ in 0..args.repeat {
         for f in &args.files {
-            if let Err(e) = bench(f, args.access) {
+            if let Err(e) = bench(f, args.access, args.suite) {
                 eprintln!("{}: {e}", f.display());
             }
         }

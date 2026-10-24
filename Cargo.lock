@@ -1569,6 +1569,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "rayon",
  "regex",
+ "regex-syntax",
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",

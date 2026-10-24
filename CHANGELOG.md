@@ -4,6 +4,48 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-10-24 — Milestone 2: search and filter
+
+### Added
+
+- Search (Ctrl+F): literal or regex, match case with Unicode case folding,
+  whole word, whole cell, current column only; background job with live
+  counter, F3 / Shift+F3 before it finishes, virtualized results panel,
+  highlighting of matches in visible cells, cap of 1,000,000 results with
+  a "more exist" indicator.
+- Filter (Ctrl+Shift+L or the column header menu): contains, equals,
+  starts with, regex, empty, not empty and numeric range per column,
+  combined with AND; the grid shows the matching rows live while the
+  filter runs ("N of M rows match"), up to 4,000,000 rows.
+- Record visitor with an exact raw-byte prefilter: records that cannot
+  contain a match are skipped without being split. Records with escapes
+  (`""`, `\"`, text after a closing quote) are flagged by the scanner and
+  always checked on their decoded values.
+- Literal prefilters are transcoded to the file's encoding, so UTF-16 and
+  code-page files are searched efficiently; everything else decodes.
+- `katak-bench --suite`: search and filter throughput.
+
+### Changed
+
+- Search hits and filtered rows live in chunked vectors: the UI never waits
+  for a large reallocation while a job holds the results lock (filtered
+  view: max frame 38 ms -> 9 ms, private memory 394 MB -> 201 MB).
+
+### Decisions
+
+- The header row is not searched or filtered.
+- A column that a row does not have compares as an empty value.
+- Cells larger than 64 MB are searched in their first 64 MB.
+- Search ignores an active filter (it always covers the whole file).
+
+### Measured (Core Ultra 9 285, Windows 11, cached files)
+
+- Literal search 1.27–1.37 GB/s (1 GB file), 0.95–1.0 GB/s (10 GB);
+  case-insensitive 809 MB/s; regex 1.14–1.31 GB/s (1 GB), 975 MB/s (10 GB).
+- Filters: literal 1.17–1.28 GB/s, numeric range 771–810 MB/s.
+- UI time per frame with search highlighting max 4.6 ms; filtered view
+  (scrolling and jumping while indexing and filtering run) max 9.0 ms.
+
 ## [0.1.0] — 2026-10-24 — Milestone 1: open and view
 
 ### Added

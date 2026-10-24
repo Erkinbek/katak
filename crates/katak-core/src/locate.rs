@@ -287,12 +287,14 @@ impl Locator {
             (_, Some(l)) if l == CR => (end - w, Term::Cr),
             _ => (end, Term::None),
         };
+        // Not scanned, so unknown: report escapes to stay conservative.
         Ok(RecSpan {
             start,
             content_end,
             end,
             fields: 0,
             term,
+            escaped: true,
         })
     }
 

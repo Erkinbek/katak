@@ -32,6 +32,16 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
             format!("~{}", group(stats.rows))
         };
         ui.label(format!("of {total}"));
+        if let Some((matched, capped, running)) = tab.filter.status() {
+            sep(ui);
+            let more = if capped { "+" } else { "" };
+            let text = format!(
+                "Filtered: {}{more} of {total} rows{}",
+                group(matched),
+                if running { " (scanning)" } else { "" }
+            );
+            ui.label(RichText::new(text).strong());
+        }
         sep(ui);
         let col = tab.info.cursor_col;
         match column_name {
