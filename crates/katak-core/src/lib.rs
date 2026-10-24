@@ -6,6 +6,7 @@
 
 pub mod detect;
 pub mod dialect;
+pub mod document;
 pub mod encoding;
 pub mod fields;
 pub mod index;
