@@ -72,6 +72,7 @@ fn bench(path: &PathBuf, access: AccessMode) -> Result<(), Box<dyn std::error::E
         no_notify(),
     )?;
     let opened = t.elapsed();
+    println!("   private memory right after open: {}", mem());
     let first = doc.first_data_row()?;
     let rows = doc.locator().records_from(first, 60)?.rows;
     let mut cells = 0;
@@ -115,6 +116,8 @@ fn bench(path: &PathBuf, access: AccessMode) -> Result<(), Box<dyn std::error::E
         st.line_endings.label(),
         st.warnings
     );
+
+    println!("   private memory after indexing (before jumps): {}", mem());
 
     // Random jumps in the indexed region: locate + 60 rows + 40 columns.
     let total = st.rows.max(1);
