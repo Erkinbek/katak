@@ -81,6 +81,8 @@ enum Confirm {
     Quit,
     /// Drop all edits of the active tab.
     Discard,
+    /// Reload tab `i` from disk, dropping its edits.
+    Reload(usize),
     /// Replace All found more cells than are kept as edits: rewrite the
     /// file of tab `tab` instead.
     Rewrite {
@@ -119,6 +121,9 @@ pub struct KatakApp {
     save_as_picker: Option<Receiver<Option<PathBuf>>>,
     quit_after_save: bool,
     allow_close: bool,
+    /// How files are opened (`--buffered` forces network-drive behaviour).
+    access: katak_core::source::AccessMode,
+    watcher: crate::watch::Watcher,
 }
 
 impl KatakApp {
@@ -129,6 +134,10 @@ impl KatakApp {
             .unwrap_or_default();
         let ctx = cc.egui_ctx.clone();
         let notify: Notify = Arc::new(move || ctx.request_repaint());
+        // The UI thread never waits on a slow (network) drive: missing
+        // blocks load in the background and the grid shows "loading".
+        katak_core::source::set_nonblocking_reads(true);
+        let watcher = crate::watch::Watcher::start(notify.clone());
         let mut app = KatakApp {
             tabs: Vec::new(),
             active: 0,
@@ -155,6 +164,12 @@ impl KatakApp {
             save_as_picker: None,
             quit_after_save: false,
             allow_close: false,
+            watcher,
+            access: if args.buffered {
+                katak_core::source::AccessMode::Buffered
+            } else {
+                katak_core::source::AccessMode::Auto
+            },
         };
         let since = app.perf.since_start();
         app.perf.note(format!(
@@ -174,7 +189,11 @@ impl KatakApp {
             return;
         }
         let t = Instant::now();
-        match Tab::open(&path, self.notify.clone()) {
+        let opts = katak_core::document::OpenOptions {
+            access: self.access,
+            ..Default::default()
+        };
+        match Tab::open_with(&path, opts, self.notify.clone()) {
             Ok(tab) => {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 self.perf.note(format!(
@@ -548,6 +567,21 @@ impl KatakApp {
                         }
                     }
                 });
+                let current = self.tabs.get(self.active).map(|t| t.doc.dialect().encoding);
+                let mut reopen_with = None;
+                ui.add_enabled_ui(current.is_some(), |ui| {
+                    ui.menu_button("Reopen with encoding", |ui| {
+                        for e in katak_core::encoding::CHOICES {
+                            if ui.radio(current == Some(*e), e.name()).clicked() {
+                                reopen_with = Some(*e);
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                if let Some(e) = reopen_with {
+                    self.reopen_with_encoding(e);
+                }
                 ui.separator();
                 let has = !self.tabs.is_empty();
                 if ui
@@ -839,6 +873,89 @@ impl KatakApp {
                 });
             }
         });
+    }
+
+    /// Re-parses the active file in another encoding.
+    fn reopen_with_encoding(&mut self, e: katak_core::encoding::TextEncoding) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab.dirty() || tab.save.is_some() {
+            self.messages
+                .push("Save or discard your edits first, then change the encoding.".into());
+            return;
+        }
+        let mut d = tab.doc.dialect().clone();
+        d.encoding = e;
+        match tab.doc.set_dialect(d) {
+            Ok(()) => tab.banner_dismissed = false,
+            Err(err) => self.messages.push(err.to_string()),
+        }
+    }
+
+    /// Reloads tab `i` from disk (its edits are dropped).
+    fn reload(&mut self, i: usize) {
+        if let Some(tab) = self.tabs.get_mut(i) {
+            tab.grid.reload_keep_layout();
+            tab.change_dismissed = None;
+            if let Err(e) = tab.doc.reopen() {
+                self.messages
+                    .push(format!("Reloading {} failed: {e}", tab.title));
+            }
+        }
+    }
+
+    /// "The file changed on disk" for the active tab.
+    fn change_banner(&mut self, ui: &mut egui::Ui) {
+        let i = self.active;
+        let Some(tab) = self.tabs.get_mut(i) else {
+            return;
+        };
+        let Some(change) = self.watcher.change(&tab.doc) else {
+            return;
+        };
+        if tab.change_dismissed == Some(change) || tab.save.is_some() {
+            return;
+        }
+        let text = match change {
+            crate::watch::Change::Gone => "The file was moved or deleted on disk. Katak still shows the contents it had when it was opened.".to_string(),
+            crate::watch::Change::Modified { len } => {
+                let before = tab.doc.source().len();
+                let size = if len > before {
+                    format!(" (it grew by {})", katak_core::sys::human_bytes(len - before))
+                } else if len < before {
+                    format!(" (it shrank by {})", katak_core::sys::human_bytes(before - len))
+                } else {
+                    String::new()
+                };
+                format!("Another program changed the file on disk{size}. Katak shows the version it opened.")
+            }
+        };
+        let mut reload = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(0x1E, 0x4A, 0x6E))
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::WHITE, text);
+                    if matches!(change, crate::watch::Change::Modified { .. })
+                        && ui.button("Reload").clicked()
+                    {
+                        reload = true;
+                    }
+                    if ui.button("Keep this version").clicked() {
+                        tab.change_dismissed = Some(change);
+                    }
+                });
+            });
+        if reload {
+            if tab.dirty() {
+                self.confirm = Some(Confirm::Reload(i));
+            } else {
+                self.reload(i);
+            }
+        }
     }
 
     fn has_banner(&self) -> bool {
@@ -1197,6 +1314,11 @@ impl KatakApp {
                     "",
                     "Discard",
                 ),
+                Confirm::Reload(_) => (
+                    "Reload the file from disk? Your unsaved edits will be lost.".to_string(),
+                    "",
+                    "Reload",
+                ),
                 Confirm::Rewrite { .. } => unreachable!(),
             };
             let mut answer = None;
@@ -1240,6 +1362,7 @@ impl KatakApp {
                         self.allow_close = true;
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
+                    (Some(Confirm::Reload(i)), 2) => self.reload(i),
                     (Some(Confirm::Discard), 2) => {
                         if let Some(tab) = self.tabs.get_mut(self.active) {
                             tab.doc.overlay.clear();
@@ -1340,6 +1463,16 @@ impl KatakApp {
         {
             match show {
                 Some("parse") => self.open_parse_dialog(),
+                Some("parse-raw") => {
+                    self.open_parse_dialog();
+                    if let Some(d) = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|t| t.parse_dialog.as_mut())
+                    {
+                        d.raw_preview = true;
+                    }
+                }
                 Some("goto") => {
                     self.goto = Some(GotoDialog {
                         focus: true,
@@ -1517,6 +1650,19 @@ impl eframe::App for KatakApp {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+        self.watcher
+            .watch(self.tabs.iter().map(|t| t.path.clone()).collect());
+        let changed = self.tabs.get(self.active).is_some_and(|t| {
+            self.watcher
+                .change(&t.doc)
+                .is_some_and(|c| t.change_dismissed != Some(c) && t.save.is_none())
+        });
+        if changed {
+            egui::Panel::top("changed")
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.change_banner(ui));
+        }
         if self.has_banner() {
             egui::Panel::top("banner")
                 .show_separator_line(false)

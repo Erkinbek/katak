@@ -2,7 +2,8 @@
 
 use std::time::Instant;
 
-use eframe::egui::{self, RichText, ScrollArea};
+use eframe::egui::text::LayoutJob;
+use eframe::egui::{self, Color32, RichText, ScrollArea, TextFormat};
 use katak_core::detect::Detection;
 use katak_core::dialect::{Delimiter, Dialect, Escape};
 use katak_core::document::preview_rows;
@@ -10,6 +11,9 @@ use katak_core::encoding::{self, TextEncoding};
 
 const PREVIEW_ROWS: usize = 50;
 const PREVIEW_COLS: usize = 40;
+/// Sample bytes and characters per line shown as raw text.
+const RAW_BYTES: usize = 64 << 10;
+const RAW_LINE_CHARS: usize = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DelimChoice {
@@ -20,11 +24,12 @@ enum DelimChoice {
     Colon,
     Pipe,
     Whitespace,
+    Lines,
     Custom,
 }
 
 impl DelimChoice {
-    const ALL: [(DelimChoice, &'static str); 8] = [
+    const ALL: [(DelimChoice, &'static str); 9] = [
         (DelimChoice::Comma, "Comma ,"),
         (DelimChoice::Semicolon, "Semicolon ;"),
         (DelimChoice::Tab, "Tab"),
@@ -35,6 +40,7 @@ impl DelimChoice {
             DelimChoice::Whitespace,
             "Whitespace (any run of spaces/tabs)",
         ),
+        (DelimChoice::Lines, "None: one value per line (raw text)"),
         (DelimChoice::Custom, "Custom:"),
     ];
 
@@ -47,6 +53,7 @@ impl DelimChoice {
             Delimiter::Char(':') => (DelimChoice::Colon, String::new()),
             Delimiter::Char('|') => (DelimChoice::Pipe, String::new()),
             Delimiter::Whitespace => (DelimChoice::Whitespace, String::new()),
+            Delimiter::Lines => (DelimChoice::Lines, String::new()),
             Delimiter::Char(c) => (DelimChoice::Custom, c.to_string()),
             Delimiter::Str(s) => (DelimChoice::Custom, s.clone()),
         }
@@ -69,6 +76,8 @@ pub struct ParseDialog {
     preview_for: Option<Dialect>,
     preview: Result<Vec<Vec<String>>, String>,
     pub preview_ms: f64,
+    /// Show the sample's characters instead of the parsed table.
+    pub raw_preview: bool,
 }
 
 impl ParseDialog {
@@ -83,6 +92,7 @@ impl ParseDialog {
             preview_for: None,
             preview: Ok(Vec::new()),
             preview_ms: 0.0,
+            raw_preview: false,
         }
     }
 
@@ -95,6 +105,7 @@ impl ParseDialog {
             DelimChoice::Colon => Delimiter::Char(':'),
             DelimChoice::Pipe => Delimiter::Char('|'),
             DelimChoice::Whitespace => Delimiter::Whitespace,
+            DelimChoice::Lines => Delimiter::Lines,
             DelimChoice::Custom => {
                 let s = self.custom.replace("\\t", "\t");
                 let mut chars = s.chars();
@@ -179,12 +190,21 @@ impl ParseDialog {
                         self.refresh_preview(sample, whole);
                         ui.horizontal(|ui| {
                             ui.strong("Preview");
+                            ui.selectable_value(&mut self.raw_preview, false, "Table");
+                            ui.selectable_value(&mut self.raw_preview, true, "Raw text")
+                                .on_hover_text(
+                                    "The file's characters as they are: tabs, line breaks and other control characters are shown as escapes, the delimiter and quote are colored",
+                                );
                             ui.weak(format!(
                                 "first {PREVIEW_ROWS} rows, parsed in {:.2} ms",
                                 self.preview_ms
                             ));
                         });
-                        self.preview_table(ui);
+                        if self.raw_preview {
+                            self.raw_text(ui, sample);
+                        } else {
+                            self.preview_table(ui);
+                        }
                     });
                 });
             });
@@ -196,6 +216,7 @@ impl ParseDialog {
 
     fn options(&mut self, ui: &mut egui::Ui, detection: &Detection) {
         ui.strong("Delimiter");
+        let before = self.choice;
         for (choice, label) in DelimChoice::ALL {
             ui.horizontal(|ui| {
                 ui.radio_value(&mut self.choice, choice, label);
@@ -211,8 +232,15 @@ impl ParseDialog {
                 }
             });
         }
+        if self.choice == DelimChoice::Lines && before != DelimChoice::Lines {
+            // Raw text: whole lines, nothing special.
+            self.draft.quote = None;
+            self.draft.has_header = false;
+            self.draft.collapse_delimiters = false;
+            self.draft.trim = false;
+        }
         ui.add_enabled(
-            self.choice != DelimChoice::Whitespace,
+            !matches!(self.choice, DelimChoice::Whitespace | DelimChoice::Lines),
             egui::Checkbox::new(
                 &mut self.draft.collapse_delimiters,
                 "Treat consecutive delimiters as one",
@@ -273,6 +301,67 @@ impl ParseDialog {
         if detection.sep_line {
             ui.weak("An Excel \"sep=\" line is skipped.");
         }
+    }
+
+    /// The first lines of the sample as text, with control characters
+    /// escaped and the delimiter and quote colored.
+    fn raw_text(&self, ui: &mut egui::Ui, sample: &[u8]) {
+        let enc = self.draft.encoding;
+        let mut n = sample.len().min(RAW_BYTES);
+        if matches!(enc, TextEncoding::Utf16Le | TextEncoding::Utf16Be) {
+            n &= !1;
+        }
+        let text = enc.decode(&sample[..n]);
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let delim = match &self.draft.delimiter {
+            Delimiter::Char(c) => Some(*c),
+            _ => None,
+        };
+        let quote = self.draft.quote;
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let plain = ui.visuals().text_color();
+        let escape = ui.visuals().weak_text_color();
+        let (delim_color, quote_color) = if ui.visuals().dark_mode {
+            (
+                Color32::from_rgb(0xF0, 0xB4, 0x4C),
+                Color32::from_rgb(0x7F, 0xB8, 0xF0),
+            )
+        } else {
+            (
+                Color32::from_rgb(0xB0, 0x60, 0x00),
+                Color32::from_rgb(0x1F, 0x5F, 0xB0),
+            )
+        };
+        ScrollArea::both()
+            .id_salt("raw-preview")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut lines = text.split_inclusive('\n').take(PREVIEW_ROWS);
+                for (i, line) in lines.by_ref().enumerate() {
+                    let mut job = LayoutJob::default();
+                    let mut put = |s: &str, color: Color32| {
+                        job.append(s, 0.0, TextFormat::simple(font.clone(), color));
+                    };
+                    put(&format!("{:>4}  ", i + 1), escape);
+                    for (k, c) in line.chars().enumerate() {
+                        if k == RAW_LINE_CHARS {
+                            put(" …", escape);
+                            break;
+                        }
+                        match c {
+                            '\t' => put("\\t", escape),
+                            '\r' => put("\\r", escape),
+                            '\n' => put("\\n", escape),
+                            c if c.is_control() => put(&format!("\\x{:02X}", c as u32), escape),
+                            '\u{feff}' => put("<BOM>", escape),
+                            c if Some(c) == delim => put(c.encode_utf8(&mut [0; 4]), delim_color),
+                            c if Some(c) == quote => put(c.encode_utf8(&mut [0; 4]), quote_color),
+                            c => put(c.encode_utf8(&mut [0; 4]), plain),
+                        }
+                    }
+                    ui.label(job);
+                }
+            });
     }
 
     fn preview_table(&self, ui: &mut egui::Ui) {

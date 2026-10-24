@@ -1,7 +1,7 @@
 //! Katak — a fast, non-freezing viewer/editor for huge delimited text files.
 //!
 //! ```text
-//! katak [FILE...] [--perf LOG] [--self-test] [--screenshot PNG [--show DIALOG]]
+//! katak [FILE...] [--perf LOG] [--self-test] [--screenshot PNG [--show DIALOG]] [--buffered]
 //! ```
 //!
 //! `--perf LOG` appends timing measurements (startup, first paint, frame
@@ -9,7 +9,7 @@
 //! programmatically for a few seconds and exits; it is how the frame-time
 //! targets are measured. `--screenshot PNG` saves the window contents
 //! once the first file is shown (optionally with a dialog open or an
-//! action run: `parse`, `goto`, `shortcuts`, `edit`, `export`, `exportto=PATH`,
+//! action run: `parse`, `parse-raw`, `goto`, `shortcuts`, `edit`, `export`, `exportto=PATH`,
 //! `search=TEXT`, `filter=COL:TEXT`, `replace=FIND:WITH`, `replaceall=FIND:WITH`,
 //! `sort=COL:asc|desc`) and exits.
 
@@ -27,6 +27,7 @@ mod sort_ui;
 mod status;
 mod tab;
 mod theme;
+mod watch;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -39,6 +40,8 @@ pub struct Args {
     pub self_test: bool,
     pub screenshot: Option<PathBuf>,
     pub show: Option<String>,
+    /// `--buffered`: read files like a network drive (no memory map).
+    pub buffered: bool,
 }
 
 fn parse_args() -> Args {
@@ -50,6 +53,7 @@ fn parse_args() -> Args {
             Some("--self-test") => args.self_test = true,
             Some("--screenshot") => args.screenshot = it.next().map(PathBuf::from),
             Some("--show") => args.show = it.next().and_then(|s| s.into_string().ok()),
+            Some("--buffered") => args.buffered = true,
             _ => args.files.push(PathBuf::from(a)),
         }
     }

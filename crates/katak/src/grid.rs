@@ -21,6 +21,7 @@ use katak_core::locate::{FetchEnd, RowPos};
 use katak_core::logical::{LKind, LPos, LRow};
 use katak_core::overlay::{ColRef, Deleted, RowRef};
 use katak_core::search::Matcher;
+use katak_core::source::is_pending;
 
 use crate::theme::GridColors;
 
@@ -486,9 +487,15 @@ impl Grid {
                 widths[c] = widths[c].max(v.chars().count());
             }
         }
+        // A single column (raw lines) may take more room.
+        let max_w = if ncols == 1 {
+            MAX_AUTO_WIDTH * 4.0
+        } else {
+            MAX_AUTO_WIDTH
+        };
         self.cols.widths = widths
             .iter()
-            .map(|&n| (n as f32 * char_w + 2.0 * CELL_PAD + 4.0).clamp(48.0, MAX_AUTO_WIDTH))
+            .map(|&n| (n as f32 * char_w + 2.0 * CELL_PAD + 4.0).clamp(48.0, max_w))
             .collect();
         let data = if header && !rows.is_empty() {
             &rows[1..]
@@ -587,16 +594,21 @@ impl Grid {
     }
 
     /// Shows the last page; returns the last row's position.
-    fn go_bottom(&mut self, doc: &mut Document, visible: usize) -> Option<LPos> {
+    fn go_bottom(&mut self, doc: &mut Document, visible: usize) -> Result<Option<LPos>, ()> {
         let end = doc.end_lpos();
-        let rows = doc
-            .lrows_before(end, visible.saturating_sub(1).max(1))
-            .ok()?;
-        let (first, last) = (rows.first()?.pos, rows.last()?.pos);
+        let rows = match doc.lrows_before(end, visible.saturating_sub(1).max(1)) {
+            Ok(r) => r,
+            Err(e) if is_pending(&e) => return Err(()),
+            Err(_) => return Ok(None),
+        };
+        let (Some(first), Some(last)) = (rows.first().map(|r| r.pos), rows.last().map(|r| r.pos))
+        else {
+            return Ok(None);
+        };
         self.top = first;
         self.top_px = 0.0;
         self.clamp_top(doc);
-        Some(last)
+        Ok(Some(last))
     }
 
     /// Handles position commands in the filtered view; false for the others.
@@ -646,6 +658,9 @@ impl Grid {
 
     fn apply_commands(&mut self, doc: &mut Document, row_h: f32, visible: usize, view_w: f32) {
         let cmds = std::mem::take(&mut self.commands);
+        // Jumps into data that is still loading from a slow drive are
+        // retried on the next frame.
+        let mut retry = Vec::new();
         for c in cmds {
             if self.is_list() && self.list_command(doc, c, visible) {
                 continue;
@@ -655,19 +670,25 @@ impl Grid {
                     // Logical row n: locate the source record, then adjust
                     // for inserted/deleted rows before it.
                     let hdr = doc.header_records();
-                    if let Ok(p) = doc.locator().locate_record(n + hdr) {
-                        let pos = LPos { rec: p, sub: 0 };
-                        let diff = n as i64 - doc.lnumber(&pos) as i64;
-                        let pos = Self::offset_pos(doc, pos, diff);
-                        self.goto(doc, pos, visible);
+                    match doc.locator().locate_record(n + hdr) {
+                        Ok(p) => {
+                            let pos = LPos { rec: p, sub: 0 };
+                            let diff = n as i64 - doc.lnumber(&pos) as i64;
+                            let pos = Self::offset_pos(doc, pos, diff);
+                            self.goto(doc, pos, visible);
+                        }
+                        Err(e) if is_pending(&e) => retry.push(c),
+                        Err(_) => {}
                     }
                 }
-                GridCommand::GotoOffset(off) => {
-                    if let Ok(p) = doc.locator().locate_offset(off) {
+                GridCommand::GotoOffset(off) => match doc.locator().locate_offset(off) {
+                    Ok(p) => {
                         let pos = doc.lpos_of(p);
                         self.goto(doc, pos, visible);
                     }
-                }
+                    Err(e) if is_pending(&e) => retry.push(c),
+                    Err(_) => {}
+                },
                 GridCommand::GotoRecord(p) => {
                     let pos = doc.lpos_of(p);
                     self.goto(doc, pos, visible);
@@ -677,20 +698,26 @@ impl Grid {
                     self.cursor = self.top;
                     self.top_px = 0.0;
                 }
-                GridCommand::Bottom => {
-                    if let Some(last) = self.go_bottom(doc, visible) {
-                        self.cursor = last;
-                    }
-                }
+                GridCommand::Bottom => match self.go_bottom(doc, visible) {
+                    Ok(Some(last)) => self.cursor = last,
+                    Ok(None) => {}
+                    Err(()) => retry.push(c),
+                },
                 GridCommand::ScrollRows(n) => self.move_top(doc, n),
                 GridCommand::ScrollX(px) => self.scroll_x = (self.scroll_x + px).max(0.0),
                 GridCommand::JumpFraction(f) => {
                     let (a, b) = (doc.data_start(), doc.source().len());
                     let off = a + ((b - a) as f64 * f.clamp(0.0, 1.0) as f64) as u64;
                     if f >= 0.999 {
-                        self.go_bottom(doc, visible);
-                    } else if let Ok(p) = doc.locator().locate_offset(off) {
-                        self.top = LPos { rec: p, sub: 0 };
+                        if self.go_bottom(doc, visible).is_err() {
+                            retry.push(c);
+                        }
+                    } else {
+                        match doc.locator().locate_offset(off) {
+                            Ok(p) => self.top = LPos { rec: p, sub: 0 },
+                            Err(e) if is_pending(&e) => retry.push(c),
+                            Err(_) => {}
+                        }
                     }
                     self.top_px = 0.0;
                     self.clamp_top(doc);
@@ -698,6 +725,7 @@ impl Grid {
                 GridCommand::AutoFit(c) => self.autofit(doc, c),
             }
         }
+        self.commands.extend(retry);
         // Normalize the sub-row offset into whole rows.
         if self.top_px >= row_h {
             let n = (self.top_px / row_h).floor() as i64;
@@ -748,12 +776,14 @@ impl Grid {
     // ----------------------------------------------------------- fetching
 
     /// Rows `[ltop, ltop + n)` of the filtered view.
-    fn fetch_list(&mut self, doc: &mut Document, l: &SharedFilter, n: usize) -> Vec<GRow> {
+    /// Rows of the list view; (previous rows, true) while some are still
+    /// loading from a slow drive.
+    fn fetch_list(&mut self, doc: &mut Document, l: &SharedFilter, n: usize) -> (Vec<GRow>, bool) {
         let hdr = doc.header_records();
         let picked: Vec<Row> = {
             let d = l.lock();
             if d.rows.is_empty() {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             self.ltop = self.ltop.min(d.rows.len() - 1);
             self.lcur = self.lcur.min(d.rows.len() - 1);
@@ -766,8 +796,10 @@ impl Grid {
                 record: r.record,
                 exact: true,
             };
-            let Ok(f) = doc.locator().records_from(rp, 1) else {
-                continue;
+            let f = match doc.locator().records_from(rp, 1) {
+                Ok(f) => f,
+                Err(e) if is_pending(&e) => return (self.rows.clone(), true),
+                Err(_) => continue,
             };
             if let Some((p, span)) = f
                 .rows
@@ -787,13 +819,15 @@ impl Grid {
                 });
             }
         }
-        out
+        (out, false)
     }
 
     fn fetch_natural(&mut self, doc: &mut Document, n: usize) -> (Vec<GRow>, bool) {
-        let (rows, end) = doc
-            .lrows_from(self.top, n)
-            .unwrap_or((Vec::new(), FetchEnd::Eof));
+        let (rows, end) = match doc.lrows_from(self.top, n) {
+            Ok(r) => r,
+            Err(e) if is_pending(&e) => return (self.rows.clone(), true),
+            Err(_) => (Vec::new(), FetchEnd::Eof),
+        };
         let first = rows.first().map(|r| doc.lnumber(&r.pos)).unwrap_or(0);
         let rows = rows
             .into_iter()
@@ -1339,7 +1373,7 @@ impl Grid {
             if len > 0 && self.ltop + visible > len + 1 {
                 self.ltop = len.saturating_sub(visible.saturating_sub(1));
             }
-            (self.fetch_list(doc, &l, visible), false)
+            self.fetch_list(doc, &l, visible)
         } else {
             self.fetch_natural(doc, visible)
         };
