@@ -12,7 +12,7 @@ use katak_core::job::Notify;
 use serde::{Deserialize, Serialize};
 
 use crate::Args;
-use crate::grid::{GridCommand, group};
+use crate::grid::{EditAction, GridCommand, group};
 use crate::parse_dialog::{ParseAction, ParseDialog};
 use crate::perf::Perf;
 use crate::tab::Tab;
@@ -36,6 +36,8 @@ pub struct Settings {
     pub font_size: f32,
     pub monospace: bool,
     pub recent: Vec<PathBuf>,
+    /// Keep the previous version as `name.bak` when saving.
+    pub backup: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +47,7 @@ impl Default for Settings {
             font_size: 14.0,
             monospace: false,
             recent: Vec::new(),
+            backup: false,
         }
     }
 }
@@ -56,6 +59,16 @@ struct ShotPlan {
     since: Option<Instant>,
     requested: bool,
     done: Arc<AtomicBool>,
+}
+
+/// A question that needs an answer before going on.
+enum Confirm {
+    /// Close tab `i` with unsaved changes.
+    CloseTab(usize),
+    /// Quit with unsaved changes.
+    Quit,
+    /// Drop all edits of the active tab.
+    Discard,
 }
 
 #[derive(Default)]
@@ -80,6 +93,12 @@ pub struct KatakApp {
     shot: Option<ShotPlan>,
     /// `--show` action, run once the first file is painted.
     pending_show: Option<String>,
+    confirm: Option<Confirm>,
+    rename: Option<(usize, String)>,
+    pending_copy: Option<String>,
+    save_as_picker: Option<Receiver<Option<PathBuf>>>,
+    quit_after_save: bool,
+    allow_close: bool,
 }
 
 impl KatakApp {
@@ -110,6 +129,12 @@ impl KatakApp {
                 done: Arc::new(AtomicBool::new(false)),
             }),
             pending_show: args.show.clone(),
+            confirm: None,
+            rename: None,
+            pending_copy: None,
+            save_as_picker: None,
+            quit_after_save: false,
+            allow_close: false,
         };
         let since = app.perf.since_start();
         app.perf.note(format!(
@@ -172,6 +197,14 @@ impl KatakApp {
     }
 
     fn close_tab(&mut self, i: usize) {
+        if self.tabs.get(i).is_some_and(Tab::dirty) {
+            self.confirm = Some(Confirm::CloseTab(i));
+            return;
+        }
+        self.close_tab_now(i);
+    }
+
+    fn close_tab_now(&mut self, i: usize) {
         if i < self.tabs.len() {
             self.tabs.remove(i);
             if self.active >= self.tabs.len() {
@@ -201,18 +234,36 @@ impl KatakApp {
         if pressed(sc(Modifiers::COMMAND, Key::W)) {
             self.close_tab(self.active);
         }
-        if pressed(sc(Modifiers::COMMAND, Key::G)) {
-            self.goto = Some(GotoDialog {
-                focus: true,
-                ..GotoDialog::default()
-            });
-        }
+        // Shift variants first: plain shortcuts also match with Shift held.
         if pressed(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::G)) {
             self.goto = Some(GotoDialog {
                 focus: true,
                 by_offset: true,
                 ..GotoDialog::default()
             });
+        }
+        if pressed(sc(Modifiers::COMMAND, Key::G)) {
+            self.goto = Some(GotoDialog {
+                focus: true,
+                ..GotoDialog::default()
+            });
+        }
+        if pressed(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)) {
+            self.save_active(true);
+        }
+        if pressed(sc(Modifiers::COMMAND, Key::S)) {
+            self.save_active(false);
+        }
+        // Undo/redo of edits, unless a text field has the keyboard.
+        if !ctx.egui_wants_keyboard_input() {
+            if pressed(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))
+                || pressed(sc(Modifiers::COMMAND, Key::Y))
+            {
+                self.undo_redo(false);
+            }
+            if pressed(sc(Modifiers::COMMAND, Key::Z)) {
+                self.undo_redo(true);
+            }
         }
         if pressed(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::P)) {
             self.open_parse_dialog();
@@ -250,6 +301,130 @@ impl KatakApp {
         }
     }
 
+    fn undo_redo(&mut self, undo: bool) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if tab.grid.is_editing() || tab.save.is_some() {
+                return;
+            }
+            let done = if undo {
+                tab.doc.overlay.undo()
+            } else {
+                tab.doc.overlay.redo()
+            };
+            if !done {
+                self.messages.push(
+                    if undo {
+                        "Nothing to undo."
+                    } else {
+                        "Nothing to redo."
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    /// Ctrl+S (or Save As with a file dialog).
+    fn save_active(&mut self, save_as: bool) {
+        let notify = self.notify.clone();
+        let backup = self.settings.backup;
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab.save.is_some() {
+            return;
+        }
+        tab.grid.commit(&mut tab.doc);
+        if save_as {
+            let dialog = rfd::FileDialog::new()
+                .set_title("Save as")
+                .set_file_name(tab.title.clone());
+            let dialog = match tab.path.parent() {
+                Some(dir) => dialog.set_directory(dir),
+                None => dialog,
+            };
+            if cfg!(target_os = "macos") {
+                if let Some(p) = dialog.save_file() {
+                    tab.start_save(p, false, notify);
+                }
+            } else {
+                let (tx, rx) = channel();
+                let n2 = notify.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(dialog.save_file());
+                    n2();
+                });
+                self.save_as_picker = Some(rx);
+            }
+            return;
+        }
+        if !tab.dirty() {
+            self.messages.push("There are no changes to save.".into());
+            return;
+        }
+        let target = tab.path.clone();
+        tab.start_save(target, backup, notify);
+    }
+
+    /// Finishes saves whose jobs have ended.
+    fn poll_saves(&mut self) {
+        let notify = self.notify.clone();
+        for tab in &mut self.tabs {
+            let Some(sj) = &tab.save else { continue };
+            if sj.job.is_running() {
+                continue;
+            }
+            let res = sj.result.lock().ok().and_then(|mut r| r.take());
+            let target = sj.target.clone();
+            let job_error = sj.job.error();
+            tab.save = None;
+            match res {
+                Some(Ok(report)) => {
+                    let outcome = if target == tab.path {
+                        tab.grid.reload_keep_layout();
+                        tab.doc.reopen().map_err(|e| e.to_string())
+                    } else {
+                        tab.retarget(&target, notify.clone())
+                    };
+                    if let Err(e) = outcome {
+                        self.messages
+                            .push(format!("Saved, but reopening the file failed: {e}"));
+                    }
+                    if report.unmappable > 0 {
+                        self.messages.push(format!(
+                            "{} characters cannot be represented in {} and were written as \"?\".",
+                            report.unmappable,
+                            tab.doc.dialect().encoding.name()
+                        ));
+                    }
+                    if report.used_fallback_quote {
+                        self.messages.push("Some values needed quoting but the file has no quote character; \" was used.".into());
+                    }
+                    self.perf.note(format!(
+                        "saved {}: {} bytes, {} records rewritten",
+                        target.display(),
+                        report.bytes_written,
+                        report.records_rewritten
+                    ));
+                }
+                Some(Err(e)) => self.messages.push(e),
+                None => self.messages.push(job_error.unwrap_or_else(|| {
+                    "The save was cancelled. The original file was not changed.".into()
+                })),
+            }
+        }
+        if self.quit_after_save && self.tabs.iter().all(|t| t.save.is_none()) {
+            self.quit_after_save = false;
+            if self.tabs.iter().any(Tab::dirty) {
+                self.messages
+                    .push("Not every file could be saved; Katak stays open.".into());
+            } else {
+                self.allow_close = true;
+                self.notify.as_ref()();
+            }
+        }
+    }
+
     fn open_parse_dialog(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.parse_dialog = Some(ParseDialog::new(tab.doc.dialect()));
@@ -258,7 +433,7 @@ impl KatakApp {
 
     fn next_ragged(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            let after = tab.info.cursor.map_or(0, |c| c.record);
+            let after = tab.info.cursor.map_or(0, |c| c.rec.record);
             match tab.doc.locator().next_ragged(after) {
                 Ok(Some(p)) => tab.grid.command(GridCommand::GotoRecord(p)),
                 Ok(None) => {
@@ -292,6 +467,21 @@ impl KatakApp {
                     }
                 });
                 ui.separator();
+                let has = !self.tabs.is_empty();
+                if ui
+                    .add_enabled(has, egui::Button::new("Save  Ctrl+S"))
+                    .clicked()
+                {
+                    self.save_active(false);
+                }
+                if ui
+                    .add_enabled(has, egui::Button::new("Save as…  Ctrl+Shift+S"))
+                    .clicked()
+                {
+                    self.save_active(true);
+                }
+                ui.checkbox(&mut self.settings.backup, "Keep a .bak copy when saving");
+                ui.separator();
                 if ui
                     .add_enabled(
                         !self.tabs.is_empty(),
@@ -303,6 +493,97 @@ impl KatakApp {
                 }
                 if ui.button("Exit").clicked() {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                let mut undo = None;
+                let mut discard = false;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let ro = tab.grid.read_only || tab.save.is_some();
+                    if ui
+                        .add_enabled(
+                            !ro && tab.doc.overlay.can_undo(),
+                            egui::Button::new("Undo  Ctrl+Z"),
+                        )
+                        .clicked()
+                    {
+                        undo = Some(true);
+                    }
+                    if ui
+                        .add_enabled(
+                            !ro && tab.doc.overlay.can_redo(),
+                            egui::Button::new("Redo  Ctrl+Y"),
+                        )
+                        .clicked()
+                    {
+                        undo = Some(false);
+                    }
+                    ui.separator();
+                    let actions: [(&str, EditAction, bool); 5] = [
+                        ("Cut  Ctrl+X", EditAction::Cut, true),
+                        ("Copy  Ctrl+C", EditAction::Copy, false),
+                        ("Clear  Delete", EditAction::Clear, true),
+                        ("Fill down  Ctrl+D", EditAction::FillDown, true),
+                        ("Select all  Ctrl+A", EditAction::SelectAll, false),
+                    ];
+                    for (label, a, modifies) in actions {
+                        if ui
+                            .add_enabled(!(modifies && ro), egui::Button::new(label))
+                            .clicked()
+                        {
+                            tab.grid.action(a);
+                        }
+                    }
+                    if ui
+                        .add_enabled(!ro, egui::Button::new("Paste  Ctrl+V"))
+                        .clicked()
+                    {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::RequestPaste);
+                    }
+                    ui.separator();
+                    let structural: [(&str, EditAction); 8] = [
+                        ("Insert row above", EditAction::InsertRowAbove),
+                        ("Insert row below", EditAction::InsertRowBelow),
+                        ("Delete selected rows", EditAction::DeleteRows),
+                        ("Insert column left", EditAction::InsertColumnLeft),
+                        ("Insert column right", EditAction::InsertColumnRight),
+                        ("Move column left", EditAction::MoveColumnLeft),
+                        ("Move column right", EditAction::MoveColumnRight),
+                        ("Delete column", EditAction::DeleteColumn),
+                    ];
+                    for (i, (label, a)) in structural.into_iter().enumerate() {
+                        if i == 3
+                            && ui
+                                .add_enabled(!ro, egui::Button::new("Rename column…"))
+                                .clicked()
+                        {
+                            let c = tab.info.cursor_col;
+                            let name = tab.doc.column_name(c).unwrap_or_default();
+                            self.rename = Some((c, name));
+                        }
+                        if ui.add_enabled(!ro, egui::Button::new(label)).clicked() {
+                            tab.grid.action(a);
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            tab.dirty() && tab.save.is_none(),
+                            egui::Button::new("Discard all edits…"),
+                        )
+                        .clicked()
+                    {
+                        discard = true;
+                    }
+                    ui.checkbox(&mut tab.grid.read_only, "Read-only");
+                } else {
+                    ui.weak("Open a file first");
+                }
+                if let Some(u) = undo {
+                    self.undo_redo(u);
+                }
+                if discard {
+                    self.confirm = Some(Confirm::Discard);
                 }
             });
             ui.menu_button("View", |ui| {
@@ -592,37 +873,201 @@ impl KatakApp {
         if close_goto {
             self.goto = None;
         }
-        // Cell viewer.
+        // Cell viewer / multi-line editor.
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let mut close = false;
-            if let Some(v) = &tab.cell_viewer {
+            let mut apply = None;
+            if let Some(v) = &mut tab.cell_viewer {
                 let mut open = true;
-                egui::Window::new(format!("Cell — column {}", v.col + 1))
+                let title = format!(
+                    "Cell — row {}, column {}",
+                    tab.info.cursor_row + 1,
+                    v.col + 1
+                );
+                egui::Window::new(title)
                     .open(&mut open)
                     .default_size([640.0, 420.0])
                     .show(ctx, |ui| {
                         if v.truncated {
                             ui.weak(format!(
-                                "Showing the first {} KB of a {} cell.",
-                                crate::tab::VIEWER_PAGE / 1024,
-                                katak_core::sys::human_bytes(v.rec.content_end - v.rec.start)
+                                "Showing the first {} KB of a larger cell (read-only).",
+                                crate::tab::VIEWER_PAGE / 1024
                             ));
                         }
+                        egui::Panel::bottom("viewer-buttons").show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if v.editable {
+                                    if ui
+                                        .add_enabled(
+                                            v.text != v.original,
+                                            egui::Button::new("Apply"),
+                                        )
+                                        .clicked()
+                                    {
+                                        apply = Some((v.row, v.col, v.text.clone()));
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        close = true;
+                                    }
+                                }
+                                if ui.button("Copy").clicked() {
+                                    ui.ctx().copy_text(v.text.clone());
+                                }
+                            });
+                        });
                         egui::ScrollArea::both()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let mut text = v.text.as_str();
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut text)
-                                        .desired_width(f32::INFINITY)
-                                        .font(egui::TextStyle::Monospace),
-                                );
+                                if v.editable {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut v.text)
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                } else {
+                                    let mut text = v.text.as_str();
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut text)
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                }
                             });
                     });
-                close = !open;
+                close |= !open;
+            }
+            if let Some((row, col, text)) = apply {
+                tab.doc.set_values(vec![(row.row_ref(), col, text)]);
+                close = true;
             }
             if close {
                 tab.cell_viewer = None;
+            }
+        }
+        // Rename column.
+        if let Some((c, name)) = &mut self.rename {
+            let mut open = true;
+            let mut done = None;
+            egui::Window::new(format!("Rename column {}", *c + 1))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    let r = ui.add(egui::TextEdit::singleline(name).desired_width(260.0));
+                    r.request_focus();
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() || enter {
+                            done = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = Some(false);
+                        }
+                    });
+                });
+            if done == Some(true)
+                && let Some(tab) = self.tabs.get_mut(self.active)
+            {
+                tab.grid.action(EditAction::RenameColumn(*c, name.clone()));
+            }
+            if done.is_some() || !open {
+                self.rename = None;
+            }
+        }
+        // Large clipboard copy.
+        if let Some(text) = &self.pending_copy {
+            let mut answer = None;
+            egui::Modal::new(egui::Id::unique("katak-copy-confirm")).show(ctx, |ui| {
+                ui.label(format!(
+                    "Copy {} to the clipboard?",
+                    katak_core::sys::human_bytes(text.len() as u64)
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if let Some(a) = answer {
+                if a {
+                    ctx.copy_text(text.clone());
+                }
+                self.pending_copy = None;
+            }
+        }
+        // Unsaved changes.
+        if let Some(c) = &self.confirm {
+            let (question, save_label, drop_label) = match c {
+                Confirm::CloseTab(i) => (
+                    format!(
+                        "Save changes to {} before closing?",
+                        self.tabs.get(*i).map_or("the file", |t| t.title.as_str())
+                    ),
+                    "Save",
+                    "Close without saving",
+                ),
+                Confirm::Quit => (
+                    "Some files have unsaved changes. Save them before quitting?".to_string(),
+                    "Save all",
+                    "Quit without saving",
+                ),
+                Confirm::Discard => (
+                    "Discard all unsaved edits of this file? This cannot be undone.".to_string(),
+                    "",
+                    "Discard",
+                ),
+            };
+            let mut answer = None;
+            egui::Modal::new(egui::Id::unique("katak-confirm")).show(ctx, |ui| {
+                ui.label(question);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if !save_label.is_empty() && ui.button(save_label).clicked() {
+                        answer = Some(1);
+                    }
+                    if ui.button(drop_label).clicked() {
+                        answer = Some(2);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(0);
+                    }
+                });
+            });
+            if let Some(a) = answer {
+                let c = self.confirm.take();
+                match (c, a) {
+                    (Some(Confirm::CloseTab(i)), 1) => {
+                        self.active = i.min(self.tabs.len().saturating_sub(1));
+                        self.save_active(false);
+                    }
+                    (Some(Confirm::CloseTab(i)), 2) => self.close_tab_now(i),
+                    (Some(Confirm::Quit), 1) => {
+                        let (notify, backup) = (self.notify.clone(), self.settings.backup);
+                        for tab in self
+                            .tabs
+                            .iter_mut()
+                            .filter(|t| t.dirty() && t.save.is_none())
+                        {
+                            tab.grid.commit(&mut tab.doc);
+                            let target = tab.path.clone();
+                            tab.start_save(target, backup, notify.clone());
+                        }
+                        self.quit_after_save = true;
+                    }
+                    (Some(Confirm::Quit), 2) => {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                    (Some(Confirm::Discard), 2) => {
+                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                            tab.doc.overlay.clear();
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         // Messages.
@@ -722,6 +1167,34 @@ impl KatakApp {
                     })
                 }
                 Some("shortcuts") => self.show_shortcuts = true,
+                Some("edit") => {
+                    // Exercise the overlay: an edited cell, a deleted row,
+                    // an inserted row and the inline editor.
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let first = tab.doc.first_lpos();
+                        if let Ok((rows, _)) = tab.doc.lrows_from(first, 5)
+                            && rows.len() == 5
+                        {
+                            tab.doc.set_values(vec![(
+                                rows[1].row_ref(),
+                                1,
+                                "Edited, with a comma".into(),
+                            )]);
+                            if let Some(span) = rows[3].span() {
+                                tab.doc.overlay.delete_rows(
+                                    &[],
+                                    &[katak_core::overlay::Deleted {
+                                        start: span.start,
+                                        end: span.end,
+                                        records: 1,
+                                    }],
+                                );
+                            }
+                        }
+                        tab.grid.action(EditAction::InsertRowBelow);
+                        tab.grid.action(EditAction::StartEdit);
+                    }
+                }
                 Some(s) if s.starts_with("search=") => {
                     let notify = self.notify.clone();
                     if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -780,6 +1253,30 @@ impl eframe::App for KatakApp {
                 self.open(f);
             }
         }
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.tabs.iter().any(Tab::dirty)
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Quit);
+        }
+        if self.allow_close
+            && !ctx.input(|i| i.viewport().close_requested())
+            && self.confirm.is_none()
+            && !self.quit_after_save
+        {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        if let Some(rx) = &self.save_as_picker
+            && let Ok(choice) = rx.try_recv()
+        {
+            self.save_as_picker = None;
+            let notify = self.notify.clone();
+            if let (Some(p), Some(tab)) = (choice, self.tabs.get_mut(self.active)) {
+                tab.start_save(p, false, notify);
+            }
+        }
+        self.poll_saves();
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -837,7 +1334,11 @@ impl eframe::App for KatakApp {
                     .default_size(180.0)
                     .show(ui, |ui| crate::search_ui::results(ui, tab));
             }
-            ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} — Katak", tab.title)));
+            let dirty = if tab.dirty() { "* " } else { "" };
+            ctx.send_viewport_cmd(ViewportCommand::Title(format!(
+                "{dirty}{} — Katak",
+                tab.title
+            )));
         }
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
@@ -851,8 +1352,20 @@ impl eframe::App for KatakApp {
                         info.painted_rows
                     ));
                 }
-                if let Some((rec, col)) = info.double_clicked {
-                    tab.open_cell(rec, col);
+                if let Some((row, col)) = info.open_cell {
+                    tab.open_cell(row, col);
+                }
+                if let Some(text) = &info.copy {
+                    ui.ctx().copy_text(text.clone());
+                }
+                if let Some(text) = info.confirm_copy.clone() {
+                    self.pending_copy = Some(text);
+                }
+                if let Some(c) = info.rename_column {
+                    self.rename = Some((c, tab.doc.column_name(c).unwrap_or_default()));
+                }
+                if let Some(m) = info.message.clone() {
+                    self.messages.push(m);
                 }
                 if let Some(c) = info.filter_column {
                     tab.filter.add_column(c);

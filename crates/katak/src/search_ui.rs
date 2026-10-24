@@ -97,7 +97,7 @@ pub fn jump(tab: &mut Tab, forward: bool, notify: &Notify) {
     let (offset, col) = tab
         .info
         .cursor
-        .map_or((0, 0), |c| (c.offset, tab.info.cursor_col));
+        .map_or((0, 0), |c| (c.rec.offset, tab.info.cursor_col));
     let hit = if forward {
         run.next_after(offset, col)
     } else {

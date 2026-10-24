@@ -19,6 +19,7 @@ pub struct GridColors {
     pub ragged: Color32,
     pub approximate: Color32,
     pub highlight: Color32,
+    pub edited: Color32,
 }
 
 impl GridColors {
@@ -39,6 +40,7 @@ impl GridColors {
                 ragged: Color32::from_rgba_unmultiplied(0xE0, 0x8A, 0x1E, 0x38),
                 approximate: Color32::from_rgb(0xE0, 0xA4, 0x3A),
                 highlight: Color32::from_rgba_unmultiplied(0xC8, 0x9B, 0x0A, 0x90),
+                edited: Color32::from_rgb(0x3C, 0xC4, 0x7A),
             }
         } else {
             GridColors {
@@ -56,6 +58,7 @@ impl GridColors {
                 ragged: Color32::from_rgba_unmultiplied(0xF0, 0x9A, 0x2B, 0x30),
                 approximate: Color32::from_rgb(0xB3, 0x6B, 0x00),
                 highlight: Color32::from_rgba_unmultiplied(0xFF, 0xD3, 0x3D, 0xB0),
+                edited: Color32::from_rgb(0x1A, 0x9E, 0x55),
             }
         }
     }

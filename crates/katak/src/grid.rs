@@ -1,23 +1,25 @@
 //! The virtualized grid.
 //!
 //! Only the visible rows *and* the visible columns are fetched, decoded,
-//! laid out and painted each frame. Vertical position is a record position
-//! (`RowPos`) plus a sub-row pixel offset; the vertical scrollbar maps to
+//! laid out and painted each frame. Rows are logical rows (source records
+//! with the edit overlay applied); the vertical position is a logical
+//! position plus a sub-row pixel offset, and the vertical scrollbar maps to
 //! byte offsets, so it behaves the same before and after indexing.
+
+use std::ops::Range;
+use std::sync::Arc;
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, EventFilter, FontId, Key, Rect, Response,
     Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use eframe::epaint::text::{LayoutJob, TextFormat, TextWrapping};
-use std::ops::Range;
-use std::sync::Arc;
-
 use katak_core::document::{Cell, Document};
 use katak_core::filter::{Row, SharedFilter};
 use katak_core::infer::{self, ColumnType};
 use katak_core::locate::{FetchEnd, RowPos};
-use katak_core::scan::RecSpan;
+use katak_core::logical::{LKind, LPos, LRow};
+use katak_core::overlay::{ColRef, Deleted, RowRef};
 use katak_core::search::Matcher;
 
 use crate::theme::GridColors;
@@ -28,6 +30,16 @@ const DEFAULT_COL_WIDTH: f32 = 110.0;
 const SCROLLBAR: f32 = 14.0;
 const CELL_PAD: f32 = 6.0;
 const TOOLTIP_CHARS: usize = 4000;
+/// Largest selection an edit operation (clear, fill, paste) may touch.
+const MAX_EDIT_CELLS: u64 = 1_000_000;
+/// Largest value edited in place; bigger ones open the cell viewer.
+const MAX_INLINE_EDIT: usize = 64 << 10;
+/// Clipboard copies above this ask for confirmation; above the hard limit
+/// they are refused (use Export instead).
+pub const COPY_CONFIRM_BYTES: usize = 100 << 20;
+const COPY_MAX_BYTES: usize = 1 << 30;
+/// Column operations rebuild the column order list.
+const MAX_COLUMN_OPS: usize = 100_000;
 
 /// Column widths (and their prefix sums) and inferred types.
 #[derive(Default)]
@@ -95,6 +107,47 @@ impl Columns {
         self.type_overrides[c] = t;
     }
 
+    /// Keeps per-column settings aligned when a column is inserted.
+    fn insert(&mut self, at: usize) {
+        if at <= self.widths.len() {
+            self.widths.insert(at, DEFAULT_COL_WIDTH);
+        }
+        if at <= self.types.len() {
+            self.types.insert(at, ColumnType::Text);
+        }
+        if at <= self.type_overrides.len() {
+            self.type_overrides.insert(at, None);
+        }
+        self.dirty = true;
+    }
+
+    fn remove(&mut self, at: usize) {
+        for v in [&mut self.widths] {
+            if at < v.len() {
+                v.remove(at);
+            }
+        }
+        if at < self.types.len() {
+            self.types.remove(at);
+        }
+        if at < self.type_overrides.len() {
+            self.type_overrides.remove(at);
+        }
+        self.dirty = true;
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.ensure(a.max(b) + 1);
+        self.widths.swap(a, b);
+        if a.max(b) < self.types.len() {
+            self.types.swap(a, b);
+        }
+        if a.max(b) < self.type_overrides.len() {
+            self.type_overrides.swap(a, b);
+        }
+        self.dirty = true;
+    }
+
     /// First column whose right edge is past `x` (relative to column 0).
     fn at_x(&self, x: f64) -> usize {
         self.prefix
@@ -107,7 +160,7 @@ impl Columns {
 /// Commands from menus, dialogs, shortcuts or the self-test.
 #[derive(Clone, Copy, Debug)]
 pub enum GridCommand {
-    /// Go to data row (0-based).
+    /// Go to data row (0-based, logical).
     GotoRow(u64),
     GotoOffset(u64),
     GotoRecord(RowPos),
@@ -120,43 +173,105 @@ pub enum GridCommand {
     AutoFit(usize),
 }
 
+/// Editing operations (menus and shortcuts).
+#[derive(Clone, Debug)]
+pub enum EditAction {
+    Copy,
+    Cut,
+    Paste(String),
+    Clear,
+    FillDown,
+    SelectAll,
+    InsertRowAbove,
+    InsertRowBelow,
+    DeleteRows,
+    InsertColumnLeft,
+    InsertColumnRight,
+    DeleteColumn,
+    MoveColumnLeft,
+    MoveColumnRight,
+    RenameColumn(usize, String),
+    StartEdit,
+}
+
 /// What the grid tells the app after a frame.
 #[derive(Clone, Debug, Default)]
 pub struct GridInfo {
-    pub cursor: Option<RowPos>,
+    pub cursor: Option<LPos>,
+    /// Logical (or, in a filtered view, original) row number, 0-based.
+    pub cursor_row: u64,
+    pub cursor_exact: bool,
     pub cursor_col: usize,
     pub columns: usize,
     pub visible_rows: usize,
     pub loading: bool,
-    pub double_clicked: Option<(RecSpan, usize)>,
+    /// Open this cell in the viewer.
+    pub open_cell: Option<(LRow, usize)>,
     pub painted_rows: usize,
     /// "Filter this column" was chosen in the header menu.
     pub filter_column: Option<usize>,
+    /// "Rename column" was chosen in the header menu.
+    pub rename_column: Option<usize>,
+    /// Text to put on the clipboard.
+    pub copy: Option<String>,
+    /// A large copy waiting for confirmation.
+    pub confirm_copy: Option<String>,
+    pub message: Option<String>,
+    pub editing: bool,
 }
 
 /// Which rows the grid shows.
 #[derive(Clone, Default)]
 pub enum View {
-    /// Every record in file order.
+    /// Every row in order.
     #[default]
     Natural,
     /// The rows of a (possibly still running) filter, in file order.
     List(SharedFilter),
 }
 
+/// A row on screen.
+#[derive(Clone, Copy, Debug)]
+struct GRow {
+    row: LRow,
+    /// Logical row number (natural view) or list index (filtered view).
+    index: u64,
+    /// Number shown in the gutter (0-based).
+    label: u64,
+    exact: bool,
+}
+
+/// A selection end: position, its row index, and a column.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    pos: LPos,
+    index: u64,
+    col: usize,
+}
+
+struct Editor {
+    row: LRow,
+    col: usize,
+    text: String,
+    /// Started by typing: arrow keys commit and move.
+    typing: bool,
+    focus: bool,
+}
+
 /// Per-tab grid state.
 pub struct Grid {
-    pub top: RowPos,
+    pub top: LPos,
     top_px: f32,
     pub scroll_x: f32,
-    pub cursor: RowPos,
+    pub cursor: LPos,
+    cursor_index: u64,
     pub cursor_col: usize,
-    pub anchor: Option<(RowPos, usize)>,
+    anchor: Option<Mark>,
     pub frozen: usize,
     pub cols: Columns,
     generation: u64,
     initialized: bool,
-    rows: Vec<(RowPos, RecSpan)>,
+    rows: Vec<GRow>,
     loading: bool,
     commands: Vec<GridCommand>,
     resize: Option<(usize, f32, f32)>,
@@ -168,26 +283,35 @@ pub struct Grid {
     /// Column the context menu was opened for.
     menu_col: Option<usize>,
     view: View,
-    /// First visible list index and cursor list index (list view only).
+    /// First visible list index and cursor list index (filtered view).
     ltop: usize,
     lcur: usize,
     /// Search matches are highlighted in visible cells.
     pub highlight: Option<Arc<Matcher>>,
-    filter_request: Option<usize>,
+    pub read_only: bool,
+    editor: Option<Editor>,
+    actions: Vec<EditAction>,
+    out: GridInfo,
+    /// Layout to restore after the document is re-read (save, Save As).
+    restore: Option<(Columns, usize, f32, u64, usize)>,
 }
 
 impl Grid {
     pub fn new() -> Self {
-        let p = RowPos {
-            offset: 0,
-            record: 0,
-            exact: true,
+        let p = LPos {
+            rec: RowPos {
+                offset: 0,
+                record: 0,
+                exact: true,
+            },
+            sub: 0,
         };
         Grid {
             top: p,
             top_px: 0.0,
             scroll_x: 0.0,
             cursor: p,
+            cursor_index: 0,
             cursor_col: 0,
             anchor: None,
             frozen: 0,
@@ -208,8 +332,38 @@ impl Grid {
             ltop: 0,
             lcur: 0,
             highlight: None,
-            filter_request: None,
+            read_only: false,
+            editor: None,
+            actions: Vec::new(),
+            out: GridInfo::default(),
+            restore: None,
         }
+    }
+
+    /// The document is about to be re-read: keep column widths and the
+    /// cursor row for the next frame.
+    pub fn reload_keep_layout(&mut self) {
+        let cols = std::mem::take(&mut self.cols);
+        self.restore = Some((
+            cols,
+            self.frozen,
+            self.scroll_x,
+            self.cursor_index,
+            self.cursor_col,
+        ));
+        self.initialized = false;
+    }
+
+    pub fn command(&mut self, c: GridCommand) {
+        self.commands.push(c);
+    }
+
+    pub fn action(&mut self, a: EditAction) {
+        self.actions.push(a);
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editor.is_some()
     }
 
     /// Switches between all rows and a filtered list. The cursor moves to
@@ -219,6 +373,7 @@ impl Grid {
         self.view = view;
         self.top_px = 0.0;
         self.anchor = None;
+        self.editor = None;
         self.ltop = 0;
         self.lcur = 0;
         if let Some(l) = self.list() {
@@ -226,11 +381,9 @@ impl Grid {
             if !d.rows.is_empty() {
                 self.lcur = d
                     .rows
-                    .partition_point(|r| r.offset < cursor.offset)
+                    .partition_point(|r| r.offset < cursor.rec.offset)
                     .min(d.rows.len() - 1);
                 self.ltop = self.lcur;
-                self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
-                self.top = self.cursor;
             }
         } else {
             self.top = cursor;
@@ -248,26 +401,27 @@ impl Grid {
         }
     }
 
-    pub fn command(&mut self, c: GridCommand) {
-        self.commands.push(c);
-    }
-
     /// Resets position and recomputes column widths/types from the sample.
     fn reset(&mut self, doc: &mut Document) {
         self.generation = doc.generation();
-        self.top = doc.first_data_row().unwrap_or(RowPos {
-            offset: doc.data_start(),
-            record: 0,
-            exact: true,
-        });
+        self.top = doc.first_lpos();
         self.top_px = 0.0;
         self.scroll_x = 0.0;
         self.cursor = self.top;
         self.cursor_col = 0;
         self.anchor = None;
+        self.editor = None;
+        self.view = View::Natural;
         self.cols = Columns::default();
         self.autosize(doc);
         self.initialized = true;
+        if let Some((cols, frozen, scroll_x, row, col)) = self.restore.take() {
+            self.cols = cols;
+            self.frozen = frozen;
+            self.scroll_x = scroll_x;
+            self.cursor_col = col;
+            self.commands.push(GridCommand::GotoRow(row));
+        }
     }
 
     /// Widths and types from the first few thousand sampled records.
@@ -302,121 +456,151 @@ impl Grid {
         self.cols.dirty = true;
     }
 
-    fn header_records(doc: &Document) -> u64 {
-        doc.header_records()
-    }
+    // ------------------------------------------------------------ moving
 
     fn clamp_top(&mut self, doc: &mut Document) {
-        if self.is_list() {
-            return;
-        }
-        if self.top.record < Self::header_records(doc) {
-            if let Ok(p) = doc.first_data_row() {
-                self.top = p;
-            }
+        if !self.is_list() && self.top.rec.record < doc.header_records() {
+            self.top = doc.first_lpos();
             self.top_px = 0.0;
         }
     }
 
+    /// Position `delta` logical rows away from `from` (clamped to the data).
+    fn offset_pos(doc: &mut Document, from: LPos, delta: i64) -> LPos {
+        if delta > 0 {
+            if let Ok((rows, _)) = doc.lrows_from(from, delta as usize + 1)
+                && let Some(r) = rows.get(delta as usize).or(rows.last())
+            {
+                return r.pos;
+            }
+        } else if delta < 0
+            && let Ok(rows) = doc.lrows_before(from, (-delta) as usize)
+            && let Some(r) = rows.first()
+        {
+            return r.pos;
+        }
+        from
+    }
+
     fn move_top(&mut self, doc: &mut Document, delta: i64) {
         if let Some(l) = self.list() {
-            let d = l.lock();
-            if !d.rows.is_empty() {
-                self.ltop = (self.ltop as i64 + delta).clamp(0, d.rows.len() as i64 - 1) as usize;
-                self.top = list_pos(d.rows.get(self.ltop).unwrap_or_default());
+            let n = l.lock().rows.len();
+            if n > 0 {
+                self.ltop = (self.ltop as i64 + delta).clamp(0, n as i64 - 1) as usize;
             }
             return;
         }
-        if delta > 0 {
-            if let Ok(f) = doc.locator().records_from(self.top, delta as usize + 1)
-                && let Some(last) = f.rows.get(delta as usize).or(f.rows.last())
-            {
-                self.top = last.0;
-            }
-        } else if delta < 0
-            && let Ok(b) = doc.locator().records_before(self.top, (-delta) as usize)
-            && let Some(first) = b.first()
-        {
-            self.top = first.0;
-        }
+        self.top = Self::offset_pos(doc, self.top, delta);
         self.clamp_top(doc);
     }
 
     fn move_cursor(&mut self, doc: &mut Document, delta: i64) {
         if let Some(l) = self.list() {
-            let d = l.lock();
-            if !d.rows.is_empty() {
-                self.lcur = (self.lcur as i64 + delta).clamp(0, d.rows.len() as i64 - 1) as usize;
-                self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
+            let n = l.lock().rows.len();
+            if n > 0 {
+                self.lcur = (self.lcur as i64 + delta).clamp(0, n as i64 - 1) as usize;
             }
             return;
         }
-        let hdr = Self::header_records(doc);
-        if delta > 0 {
-            if let Ok(f) = doc.locator().records_from(self.cursor, delta as usize + 1)
-                && let Some(r) = f.rows.get(delta as usize).or(f.rows.last())
-            {
-                self.cursor = r.0;
-            }
-        } else if delta < 0
-            && let Ok(b) = doc.locator().records_before(self.cursor, (-delta) as usize)
-            && let Some(r) = b.iter().find(|r| r.0.record >= hdr).or(b.first())
-            && r.0.record >= hdr
-        {
-            self.cursor = r.0;
-        }
+        self.cursor = Self::offset_pos(doc, self.cursor, delta);
     }
 
-    fn goto(&mut self, doc: &mut Document, pos: RowPos, visible: usize) {
+    fn goto(&mut self, doc: &mut Document, pos: LPos, visible: usize) {
         if let Some(l) = self.list() {
             let d = l.lock();
             if !d.rows.is_empty() {
                 self.lcur = d
                     .rows
-                    .partition_point(|r| r.offset < pos.offset)
+                    .partition_point(|r| r.offset < pos.rec.offset)
                     .min(d.rows.len() - 1);
                 self.ltop = self.lcur.saturating_sub(visible / 3);
-                self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
-                self.top = list_pos(d.rows.get(self.ltop).unwrap_or_default());
                 self.top_px = 0.0;
             }
             return;
         }
         self.cursor = pos;
-        // Keep a little context above the target.
-        self.top = pos;
+        self.top = Self::offset_pos(doc, pos, -((visible / 3) as i64));
         self.top_px = 0.0;
-        let ctx = (visible / 3) as i64;
-        self.move_top(doc, -ctx);
+        self.clamp_top(doc);
     }
 
     fn ensure_cursor_visible(&mut self, doc: &mut Document, visible: usize) {
-        if let Some(l) = self.list() {
-            let full = visible.saturating_sub(1).max(1);
+        let full = visible.saturating_sub(1).max(1);
+        if self.is_list() {
             if self.lcur < self.ltop {
                 self.ltop = self.lcur;
             } else if self.lcur >= self.ltop + full {
                 self.ltop = self.lcur + 1 - full;
             }
-            if let Some(r) = l.lock().rows.get(self.ltop) {
-                self.top = list_pos(r);
-            }
             return;
         }
-        if self.cursor.offset < self.top.offset {
+        let (ci, ti) = (doc.lnumber(&self.cursor), doc.lnumber(&self.top));
+        if ci < ti {
             self.top = self.cursor;
             self.top_px = 0.0;
-        } else if visible > 1 {
-            let full = visible.saturating_sub(1).max(1);
-            if let Ok(f) = doc.locator().records_from(self.top, full) {
-                let inside = f.rows.iter().any(|r| r.0.offset == self.cursor.offset);
-                if !inside && f.end != FetchEnd::Budget {
-                    self.top = self.cursor;
-                    self.top_px = 0.0;
-                    self.move_top(doc, -(full as i64 - 1));
-                }
-            }
+        } else if ci >= ti + full as u64 {
+            self.top = Self::offset_pos(doc, self.cursor, -(full as i64 - 1));
+            self.top_px = 0.0;
         }
+    }
+
+    /// Shows the last page; returns the last row's position.
+    fn go_bottom(&mut self, doc: &mut Document, visible: usize) -> Option<LPos> {
+        let end = doc.end_lpos();
+        let rows = doc
+            .lrows_before(end, visible.saturating_sub(1).max(1))
+            .ok()?;
+        let (first, last) = (rows.first()?.pos, rows.last()?.pos);
+        self.top = first;
+        self.top_px = 0.0;
+        self.clamp_top(doc);
+        Some(last)
+    }
+
+    /// Handles position commands in the filtered view; false for the others.
+    fn list_command(&mut self, doc: &mut Document, c: GridCommand, visible: usize) -> bool {
+        let Some(l) = self.list() else { return false };
+        let n = l.lock().rows.len();
+        let positional = matches!(
+            c,
+            GridCommand::GotoRow(_)
+                | GridCommand::GotoOffset(_)
+                | GridCommand::GotoRecord(_)
+                | GridCommand::Top
+                | GridCommand::Bottom
+                | GridCommand::JumpFraction(_)
+        );
+        if n == 0 || !positional {
+            return positional;
+        }
+        let page = visible.saturating_sub(1).max(1);
+        let find = |pred: &dyn Fn(&Row) -> bool| l.lock().rows.partition_point(pred).min(n - 1);
+        let (top, cur) = match c {
+            GridCommand::GotoRow(row) => {
+                let rec = row + doc.header_records();
+                let i = find(&|r| r.record < rec);
+                (i.saturating_sub(visible / 3), i)
+            }
+            GridCommand::GotoOffset(off) => {
+                let i = find(&|r| r.offset < off);
+                (i.saturating_sub(visible / 3), i)
+            }
+            GridCommand::GotoRecord(p) => {
+                let i = find(&|r| r.offset < p.offset);
+                (i.saturating_sub(visible / 3), i)
+            }
+            GridCommand::Top => (0, 0),
+            GridCommand::Bottom => (n.saturating_sub(page), n - 1),
+            GridCommand::JumpFraction(f) => (
+                ((n as f64 * f.clamp(0.0, 1.0) as f64) as usize).min(n.saturating_sub(page)),
+                self.lcur,
+            ),
+            _ => return false,
+        };
+        self.ltop = top.min(n - 1);
+        self.lcur = cur.min(n - 1);
+        self.top_px = 0.0;
+        true
     }
 
     fn apply_commands(&mut self, doc: &mut Document, row_h: f32, visible: usize, view_w: f32) {
@@ -427,24 +611,30 @@ impl Grid {
             }
             match c {
                 GridCommand::GotoRow(n) => {
-                    let hdr = Self::header_records(doc);
+                    // Logical row n: locate the source record, then adjust
+                    // for inserted/deleted rows before it.
+                    let hdr = doc.header_records();
                     if let Ok(p) = doc.locator().locate_record(n + hdr) {
-                        self.goto(doc, p, visible);
+                        let pos = LPos { rec: p, sub: 0 };
+                        let diff = n as i64 - doc.lnumber(&pos) as i64;
+                        let pos = Self::offset_pos(doc, pos, diff);
+                        self.goto(doc, pos, visible);
                     }
                 }
                 GridCommand::GotoOffset(off) => {
                     if let Ok(p) = doc.locator().locate_offset(off) {
-                        self.goto(doc, p, visible);
-                        self.clamp_top(doc);
+                        let pos = doc.lpos_of(p);
+                        self.goto(doc, pos, visible);
                     }
                 }
-                GridCommand::GotoRecord(p) => self.goto(doc, p, visible),
+                GridCommand::GotoRecord(p) => {
+                    let pos = doc.lpos_of(p);
+                    self.goto(doc, pos, visible);
+                }
                 GridCommand::Top => {
-                    if let Ok(p) = doc.first_data_row() {
-                        self.top = p;
-                        self.cursor = p;
-                        self.top_px = 0.0;
-                    }
+                    self.top = doc.first_lpos();
+                    self.cursor = self.top;
+                    self.top_px = 0.0;
                 }
                 GridCommand::Bottom => {
                     if let Some(last) = self.go_bottom(doc, visible) {
@@ -459,7 +649,7 @@ impl Grid {
                     if f >= 0.999 {
                         self.go_bottom(doc, visible);
                     } else if let Ok(p) = doc.locator().locate_offset(off) {
-                        self.top = p;
+                        self.top = LPos { rec: p, sub: 0 };
                     }
                     self.top_px = 0.0;
                     self.clamp_top(doc);
@@ -470,18 +660,18 @@ impl Grid {
         // Normalize the sub-row offset into whole rows.
         if self.top_px >= row_h {
             let n = (self.top_px / row_h).floor() as i64;
-            let before = self.top;
+            let before = (self.top, self.ltop);
             self.move_top(doc, n);
-            self.top_px = if self.top == before {
+            self.top_px = if (self.top, self.ltop) == before {
                 0.0
             } else {
                 self.top_px - n as f32 * row_h
             };
         } else if self.top_px < 0.0 {
             let n = (-self.top_px / row_h).ceil() as i64;
-            let before = self.top;
+            let before = (self.top, self.ltop);
             self.move_top(doc, -n);
-            self.top_px = if self.top == before {
+            self.top_px = if (self.top, self.ltop) == before {
                 0.0
             } else {
                 self.top_px + n as f32 * row_h
@@ -496,107 +686,12 @@ impl Grid {
         );
     }
 
-    /// Handles position commands in list view; false for the others.
-    fn list_command(&mut self, doc: &mut Document, c: GridCommand, visible: usize) -> bool {
-        let Some(l) = self.list() else { return false };
-        let n = l.lock().rows.len();
-        if n == 0 {
-            return matches!(
-                c,
-                GridCommand::GotoRow(_)
-                    | GridCommand::GotoOffset(_)
-                    | GridCommand::GotoRecord(_)
-                    | GridCommand::Top
-                    | GridCommand::Bottom
-                    | GridCommand::JumpFraction(_)
-            );
-        }
-        let page = visible.saturating_sub(1).max(1);
-        let (top, cur) = match c {
-            GridCommand::GotoRow(row) => {
-                let rec = row + Self::header_records(doc);
-                let i = l.lock().rows.partition_point(|r| r.record < rec).min(n - 1);
-                (i.saturating_sub(visible / 3), i)
-            }
-            GridCommand::GotoOffset(off) => {
-                let i = l.lock().rows.partition_point(|r| r.offset < off).min(n - 1);
-                (i.saturating_sub(visible / 3), i)
-            }
-            GridCommand::GotoRecord(p) => {
-                let i = l
-                    .lock()
-                    .rows
-                    .partition_point(|r| r.offset < p.offset)
-                    .min(n - 1);
-                (i.saturating_sub(visible / 3), i)
-            }
-            GridCommand::Top => (0, 0),
-            GridCommand::Bottom => (n.saturating_sub(page), n - 1),
-            GridCommand::JumpFraction(f) => {
-                let i =
-                    ((n as f64 * f.clamp(0.0, 1.0) as f64) as usize).min(n.saturating_sub(page));
-                (i, self.lcur)
-            }
-            _ => return false,
-        };
-        let d = l.lock();
-        self.ltop = top.min(n - 1);
-        self.lcur = cur.min(n - 1);
-        self.top = list_pos(d.rows.get(self.ltop).unwrap_or_default());
-        self.cursor = list_pos(d.rows.get(self.lcur).unwrap_or_default());
-        self.top_px = 0.0;
-        true
-    }
-
-    /// Rows `[ltop, ltop + n)` of the list view with their extents.
-    fn fetch_list(
-        &mut self,
-        doc: &mut Document,
-        l: &SharedFilter,
-        n: usize,
-    ) -> Vec<(RowPos, RecSpan)> {
-        let picked: Vec<Row> = {
-            let d = l.lock();
-            if d.rows.is_empty() {
-                return Vec::new();
-            }
-            self.ltop = self.ltop.min(d.rows.len() - 1);
-            self.lcur = self.lcur.min(d.rows.len() - 1);
-            d.rows.slice(self.ltop, self.ltop + n)
-        };
-        picked
-            .into_iter()
-            .filter_map(|r| {
-                let pos = list_pos(r);
-                let f = doc.locator().records_from(pos, 1).ok()?;
-                f.rows
-                    .into_iter()
-                    .next()
-                    .filter(|(p, _)| p.offset == pos.offset)
-            })
-            .collect()
-    }
-
-    /// Shows the last page; returns the last row.
-    fn go_bottom(&mut self, doc: &mut Document, visible: usize) -> Option<RowPos> {
-        let end = doc.locator().end_pos();
-        let rows = doc
-            .locator()
-            .records_before(end, visible.saturating_sub(1).max(1))
-            .ok()?;
-        let (first, last) = (rows.first()?.0, rows.last()?.0);
-        self.top = first;
-        self.top_px = 0.0;
-        self.clamp_top(doc);
-        Some(last)
-    }
-
     fn autofit(&mut self, doc: &mut Document, c: usize) {
         let mut chars = 4usize;
-        let rows = self.rows.clone();
-        for (_, r) in rows.iter().take(200) {
-            if let Ok(cells) = doc.cells(r, c..c + 1, 400) {
-                chars = chars.max(cells[0].text.chars().count());
+        let rows: Vec<LRow> = self.rows.iter().take(200).map(|g| g.row).collect();
+        for r in &rows {
+            if let Ok(cells) = doc.display_cells(r, c..c + 1, 400) {
+                chars = chars.max(cells[0].0.text.chars().count());
             }
         }
         if let Some((_, h)) = self.header_names.iter().find(|(i, _)| *i == c) {
@@ -609,6 +704,502 @@ impl Grid {
         );
     }
 
+    // ----------------------------------------------------------- fetching
+
+    /// Rows `[ltop, ltop + n)` of the filtered view.
+    fn fetch_list(&mut self, doc: &mut Document, l: &SharedFilter, n: usize) -> Vec<GRow> {
+        let hdr = doc.header_records();
+        let picked: Vec<Row> = {
+            let d = l.lock();
+            if d.rows.is_empty() {
+                return Vec::new();
+            }
+            self.ltop = self.ltop.min(d.rows.len() - 1);
+            self.lcur = self.lcur.min(d.rows.len() - 1);
+            d.rows.slice(self.ltop, self.ltop + n)
+        };
+        let mut out = Vec::with_capacity(picked.len());
+        for (k, r) in picked.into_iter().enumerate() {
+            let rp = RowPos {
+                offset: r.offset,
+                record: r.record,
+                exact: true,
+            };
+            let Ok(f) = doc.locator().records_from(rp, 1) else {
+                continue;
+            };
+            if let Some((p, span)) = f
+                .rows
+                .first()
+                .copied()
+                .filter(|(p, _)| p.offset == r.offset)
+            {
+                let pos = doc.lpos_of(p);
+                out.push(GRow {
+                    row: LRow {
+                        pos,
+                        kind: LKind::Src(span),
+                    },
+                    index: (self.ltop + k) as u64,
+                    label: r.record.saturating_sub(hdr),
+                    exact: true,
+                });
+            }
+        }
+        out
+    }
+
+    fn fetch_natural(&mut self, doc: &mut Document, n: usize) -> (Vec<GRow>, bool) {
+        let (rows, end) = doc
+            .lrows_from(self.top, n)
+            .unwrap_or((Vec::new(), FetchEnd::Eof));
+        let first = rows.first().map(|r| doc.lnumber(&r.pos)).unwrap_or(0);
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(k, row)| {
+                let exact = row.pos.rec.exact;
+                GRow {
+                    row,
+                    index: first + k as u64,
+                    label: first + k as u64,
+                    exact,
+                }
+            })
+            .collect();
+        (rows, end == FetchEnd::Budget)
+    }
+
+    // ---------------------------------------------------------- selection
+
+    fn cursor_mark(&self) -> Mark {
+        Mark {
+            pos: self.cursor,
+            index: self.cursor_index,
+            col: self.cursor_col,
+        }
+    }
+
+    /// (first row index, last row index, first col, last col).
+    fn selection_box(&self) -> (u64, u64, usize, usize) {
+        let c = self.cursor_mark();
+        let a = self.anchor.unwrap_or(c);
+        (
+            a.index.min(c.index),
+            a.index.max(c.index),
+            a.col.min(c.col),
+            a.col.max(c.col),
+        )
+    }
+
+    /// The rows of the selection (bounded by `max`).
+    fn selected_rows(&mut self, doc: &mut Document, max: u64) -> Result<Vec<LRow>, String> {
+        let (r0, r1, _, _) = self.selection_box();
+        let count = r1 - r0 + 1;
+        if count > max {
+            return Err(format!(
+                "The selection has {} rows; at most {} can be changed or copied at once. Use Export for more.",
+                group(count),
+                group(max)
+            ));
+        }
+        if let Some(l) = self.list() {
+            let picked = l.lock().rows.slice(r0 as usize, r1 as usize + 1);
+            let mut out = Vec::with_capacity(picked.len());
+            for r in picked {
+                let rp = RowPos {
+                    offset: r.offset,
+                    record: r.record,
+                    exact: true,
+                };
+                if let Some((p, span)) = doc
+                    .locator()
+                    .records_from(rp, 1)
+                    .map_err(|e| e.to_string())?
+                    .rows
+                    .first()
+                    .copied()
+                {
+                    out.push(LRow {
+                        pos: doc.lpos_of(p),
+                        kind: LKind::Src(span),
+                    });
+                }
+            }
+            return Ok(out);
+        }
+        let c = self.cursor_mark();
+        let start = match self.anchor {
+            Some(a) if a.index < c.index => a.pos,
+            _ => c.pos,
+        };
+        let (rows, _) = doc
+            .lrows_from(start, count as usize)
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    // ------------------------------------------------------------ editing
+
+    /// The row under the cursor (from its position, not from the rows of
+    /// the last frame, which may be stale after an edit action).
+    fn current_row(&mut self, doc: &mut Document) -> Option<LRow> {
+        if let Some(l) = self.list() {
+            let r = l.lock().rows.get(self.lcur)?;
+            let rp = RowPos {
+                offset: r.offset,
+                record: r.record,
+                exact: true,
+            };
+            let (p, span) = doc
+                .locator()
+                .records_from(rp, 1)
+                .ok()?
+                .rows
+                .first()
+                .copied()?;
+            return Some(LRow {
+                pos: doc.lpos_of(p),
+                kind: LKind::Src(span),
+            });
+        }
+        doc.lrows_from(self.cursor, 1).ok()?.0.into_iter().next()
+    }
+
+    fn start_edit(&mut self, doc: &mut Document, initial: Option<String>) {
+        if self.read_only {
+            self.out.message = Some("The file is open read-only (Edit → Read-only).".into());
+            return;
+        }
+        let Some(row) = self.current_row(doc) else {
+            return;
+        };
+        let col = self.cursor_col;
+        let typing = initial.is_some();
+        let text = match initial {
+            Some(t) => t,
+            None => {
+                let v = doc
+                    .value(&row, col, MAX_INLINE_EDIT + 1)
+                    .unwrap_or_default();
+                if v.len() > MAX_INLINE_EDIT || v.contains(['\n', '\r']) {
+                    // Large or multi-line values are edited in the cell viewer.
+                    self.out.open_cell = Some((row, col));
+                    return;
+                }
+                v
+            }
+        };
+        self.anchor = None;
+        self.editor = Some(Editor {
+            row,
+            col,
+            text,
+            typing,
+            focus: true,
+        });
+    }
+
+    /// Commits an open cell edit (before saving).
+    pub fn commit(&mut self, doc: &mut Document) {
+        self.commit_edit(doc);
+    }
+
+    fn commit_edit(&mut self, doc: &mut Document) {
+        if let Some(e) = self.editor.take() {
+            doc.set_values(vec![(e.row.row_ref(), e.col, e.text)]);
+        }
+    }
+
+    /// Runs queued edit actions.
+    fn run_actions(&mut self, doc: &mut Document, visible: usize) {
+        for a in std::mem::take(&mut self.actions) {
+            if let Err(e) = self.run_action(doc, a, visible) {
+                self.out.message = Some(e);
+            }
+        }
+    }
+
+    fn run_action(
+        &mut self,
+        doc: &mut Document,
+        a: EditAction,
+        visible: usize,
+    ) -> Result<(), String> {
+        let modifying = !matches!(a, EditAction::Copy | EditAction::SelectAll);
+        if modifying && self.read_only {
+            return Err("The file is open read-only (Edit → Read-only).".into());
+        }
+        let ncols = self.cols.len().max(1);
+        match a {
+            EditAction::StartEdit => self.start_edit(doc, None),
+            EditAction::SelectAll => {
+                let first = doc.first_lpos();
+                let end = doc.end_lpos();
+                let last = doc
+                    .lrows_before(end, 1)
+                    .ok()
+                    .and_then(|r| r.first().map(|r| r.pos))
+                    .unwrap_or(first);
+                if self.is_list() {
+                    let n = self.list().map_or(0, |l| l.lock().rows.len());
+                    self.anchor = Some(Mark {
+                        pos: first,
+                        index: 0,
+                        col: 0,
+                    });
+                    self.lcur = n.saturating_sub(1);
+                } else {
+                    self.anchor = Some(Mark {
+                        pos: first,
+                        index: doc.lnumber(&first),
+                        col: 0,
+                    });
+                    self.cursor = last;
+                }
+                self.cursor_col = ncols - 1;
+            }
+            EditAction::Copy | EditAction::Cut => {
+                let (_, _, c0, c1) = self.selection_box();
+                let rows = self.selected_rows(doc, MAX_EDIT_CELLS / (c1 - c0 + 1) as u64)?;
+                let mut text = String::new();
+                for r in &rows {
+                    for c in c0..=c1 {
+                        if c > c0 {
+                            text.push('\t');
+                        }
+                        tsv_field(
+                            &doc.value(r, c, 64 << 20).map_err(|e| e.to_string())?,
+                            &mut text,
+                        );
+                        if text.len() > COPY_MAX_BYTES {
+                            return Err("The selection is larger than 1 GB; use Export to save it to a file.".into());
+                        }
+                    }
+                    text.push('\n');
+                }
+                if text.len() > COPY_CONFIRM_BYTES {
+                    self.out.confirm_copy = Some(text);
+                } else {
+                    self.out.copy = Some(text);
+                }
+                if matches!(a, EditAction::Cut) {
+                    self.clear_selection(doc, &rows, c0, c1);
+                }
+            }
+            EditAction::Clear => {
+                let (_, _, c0, c1) = self.selection_box();
+                let rows = self.selected_rows(doc, MAX_EDIT_CELLS / (c1 - c0 + 1) as u64)?;
+                self.clear_selection(doc, &rows, c0, c1);
+            }
+            EditAction::FillDown => {
+                let (_, _, c0, c1) = self.selection_box();
+                let rows = self.selected_rows(doc, MAX_EDIT_CELLS / (c1 - c0 + 1) as u64)?;
+                let Some(first) = rows.first().copied() else {
+                    return Ok(());
+                };
+                let mut changes = Vec::new();
+                for c in c0..=c1 {
+                    let v = doc.value(&first, c, 64 << 20).map_err(|e| e.to_string())?;
+                    changes.extend(rows.iter().skip(1).map(|r| (r.row_ref(), c, v.clone())));
+                }
+                doc.set_values(changes);
+            }
+            EditAction::Paste(text) => {
+                let table = parse_tsv(&text);
+                if table.is_empty() {
+                    return Ok(());
+                }
+                let cells: u64 = table.iter().map(|r| r.len() as u64).sum();
+                if cells > MAX_EDIT_CELLS {
+                    return Err(format!(
+                        "The clipboard has {} cells; at most {} can be pasted at once.",
+                        group(cells),
+                        group(MAX_EDIT_CELLS)
+                    ));
+                }
+                let start = if self.anchor.is_some() {
+                    let (r0, _, c0, _) = self.selection_box();
+                    self.anchor = None;
+                    self.cursor_col = c0;
+                    if self.is_list() {
+                        self.lcur = r0 as usize;
+                    }
+                    let c = self.cursor_mark();
+                    c.pos
+                } else {
+                    self.cursor
+                };
+                let rows: Vec<LRow> = if let Some(l) = self.list() {
+                    let picked = l.lock().rows.slice(self.lcur, self.lcur + table.len());
+                    picked
+                        .into_iter()
+                        .filter_map(|r| {
+                            let rp = RowPos {
+                                offset: r.offset,
+                                record: r.record,
+                                exact: true,
+                            };
+                            let (p, span) = doc
+                                .locator()
+                                .records_from(rp, 1)
+                                .ok()?
+                                .rows
+                                .first()
+                                .copied()?;
+                            Some(LRow {
+                                pos: doc.lpos_of(p),
+                                kind: LKind::Src(span),
+                            })
+                        })
+                        .collect()
+                } else {
+                    doc.lrows_from(start, table.len())
+                        .map_err(|e| e.to_string())?
+                        .0
+                };
+                let mut changes = Vec::new();
+                for (r, vals) in rows.iter().zip(&table) {
+                    for (k, v) in vals.iter().enumerate() {
+                        changes.push((r.row_ref(), self.cursor_col + k, v.clone()));
+                    }
+                }
+                doc.set_values(changes);
+                if rows.len() < table.len() {
+                    self.out.message = Some(format!(
+                        "Pasted {} of {} rows (the end of the table was reached).",
+                        rows.len(),
+                        table.len()
+                    ));
+                }
+            }
+            EditAction::InsertRowAbove | EditAction::InsertRowBelow => {
+                if self.is_list() {
+                    return Err("Clear the filter to insert rows.".into());
+                }
+                let below = matches!(a, EditAction::InsertRowBelow);
+                let here = self.current_row(doc).map(|r| r.pos).unwrap_or(self.cursor);
+                // Inserting "below" means "above the next row".
+                let target = if below {
+                    doc.lrows_from(here, 2)
+                        .ok()
+                        .and_then(|(r, _)| r.get(1).map(|r| r.pos))
+                        .unwrap_or(doc.end_lpos())
+                } else {
+                    here
+                };
+                let data_end = doc.source().len();
+                let key = katak_core::logical::anchor_key(&target.rec, data_end);
+                let ids = doc.overlay.insert_rows(key, target.sub as usize, 1);
+                if !ids.is_empty() {
+                    self.cursor = LPos {
+                        rec: target.rec,
+                        sub: target.sub,
+                    };
+                    self.ensure_cursor_visible(doc, visible);
+                }
+            }
+            EditAction::DeleteRows => {
+                let rows = self.selected_rows(doc, 10_000_000)?;
+                let mut ids = Vec::new();
+                let mut ranges: Vec<Deleted> = Vec::new();
+                for r in &rows {
+                    match r.kind {
+                        LKind::New(id) => ids.push(id),
+                        LKind::Src(span) => match ranges.last_mut() {
+                            Some(last) if last.end == span.start => {
+                                last.end = span.end;
+                                last.records += 1;
+                            }
+                            _ => ranges.push(Deleted {
+                                start: span.start,
+                                end: span.end,
+                                records: 1,
+                            }),
+                        },
+                    }
+                }
+                doc.overlay.delete_rows(&ids, &ranges);
+                self.anchor = None;
+                if self.is_list() {
+                    self.out.message = Some("Deleted rows disappear from the filtered view when the filter is applied again.".into());
+                }
+            }
+            EditAction::InsertColumnLeft | EditAction::InsertColumnRight => {
+                let at = self.cursor_col + matches!(a, EditAction::InsertColumnRight) as usize;
+                let mut cols = self.column_order(doc, ncols)?;
+                let new = doc.overlay.new_column_id();
+                cols.insert(at.min(cols.len()), new);
+                doc.overlay.set_columns(Some(cols));
+                self.cols.insert(at);
+                self.cursor_col = at;
+            }
+            EditAction::DeleteColumn => {
+                let mut cols = self.column_order(doc, ncols)?;
+                if self.cursor_col < cols.len() && cols.len() > 1 {
+                    cols.remove(self.cursor_col);
+                    doc.overlay.set_columns(Some(cols));
+                    self.cols.remove(self.cursor_col);
+                    self.cursor_col = self.cursor_col.min(ncols.saturating_sub(2));
+                }
+            }
+            EditAction::MoveColumnLeft | EditAction::MoveColumnRight => {
+                let mut cols = self.column_order(doc, ncols)?;
+                let c = self.cursor_col;
+                let to = if matches!(a, EditAction::MoveColumnLeft) {
+                    c.checked_sub(1)
+                } else {
+                    (c + 1 < cols.len()).then_some(c + 1)
+                };
+                if let Some(to) = to {
+                    cols.swap(c, to);
+                    doc.overlay.set_columns(Some(cols));
+                    self.cols.swap(c, to);
+                    self.cursor_col = to;
+                }
+            }
+            EditAction::RenameColumn(c, name) => {
+                let Some(h) = doc.header_record().map_err(|e| e.to_string())? else {
+                    return Err("This file has no header row (see Parsing options) — there is no name to change.".into());
+                };
+                doc.set_values(vec![(RowRef::Src(h.start), c, name)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_selection(&mut self, doc: &mut Document, rows: &[LRow], c0: usize, c1: usize) {
+        let mut changes = Vec::new();
+        for r in rows {
+            for c in c0..=c1 {
+                changes.push((r.row_ref(), c, String::new()));
+            }
+        }
+        doc.set_values(changes);
+    }
+
+    /// The current column order, materialized for a column operation.
+    fn column_order(&self, doc: &Document, ncols: usize) -> Result<Vec<ColRef>, String> {
+        if ncols > MAX_COLUMN_OPS {
+            return Err(format!(
+                "Column operations are limited to files with at most {} columns.",
+                group(MAX_COLUMN_OPS as u64)
+            ));
+        }
+        Ok(match doc.overlay.columns() {
+            Some(c) => {
+                let mut c = c.to_vec();
+                while c.len() < ncols {
+                    c.push(doc.overlay.col_ref(c.len()));
+                }
+                c
+            }
+            None => (0..ncols as u32).map(ColRef::Src).collect(),
+        })
+    }
+
+    // ------------------------------------------------------------- drawing
+
     /// Draws the grid in all of `ui`'s available space.
     pub fn show(
         &mut self,
@@ -618,7 +1209,7 @@ impl Grid {
         font_size: f32,
         monospace: bool,
     ) -> GridInfo {
-        let mut info = GridInfo::default();
+        self.out = GridInfo::default();
         self.font_size = font_size;
         self.monospace = monospace;
         doc.begin_frame();
@@ -651,7 +1242,9 @@ impl Grid {
 
         // Columns known so far.
         let stats_fields = doc.index().read().max_fields as usize;
-        let ncols = self.cols.len().max(stats_fields).clamp(1, 10_000_000);
+        let ncols = doc
+            .logical_columns(self.cols.len().max(stats_fields))
+            .clamp(1, 10_000_000);
         self.cols.ensure(ncols);
         self.cols.rebuild();
 
@@ -665,17 +1258,22 @@ impl Grid {
             pos2(full.right() - SCROLLBAR, full.bottom() - SCROLLBAR),
         );
         let visible = ((cells_rect.height() / row_h).ceil() as usize + 1).max(1);
-        info.visible_rows = visible;
+        self.out.visible_rows = visible;
 
-        self.handle_input(ui, &response, doc, row_h, visible, cells_rect);
-        self.apply_commands(doc, row_h, visible, cells_rect.width());
-        if let Ok(p) = doc.locator().refine(self.top) {
-            self.top = p;
+        if self.editor.is_none() {
+            self.handle_input(ui, &response, doc, visible, cells_rect);
         }
-        if !self.cursor.exact
-            && let Ok(p) = doc.locator().refine(self.cursor)
+        self.run_actions(doc, visible);
+        self.apply_commands(doc, row_h, visible, cells_rect.width());
+        if !self.top.rec.exact
+            && let Ok(p) = doc.locator().refine(self.top.rec)
         {
-            self.cursor = p;
+            self.top.rec = p;
+        }
+        if !self.cursor.rec.exact
+            && let Ok(p) = doc.locator().refine(self.cursor.rec)
+        {
+            self.cursor.rec = p;
         }
 
         // Fetch visible rows.
@@ -686,19 +1284,13 @@ impl Grid {
             }
             (self.fetch_list(doc, &l, visible), false)
         } else {
-            match doc.locator().records_from(self.top, visible) {
-                Ok(f) => {
-                    let loading = f.end == FetchEnd::Budget;
-                    (f.rows, loading)
-                }
-                Err(_) => (Vec::new(), false),
-            }
+            self.fetch_natural(doc, visible)
         };
-        // Do not leave empty space at the end of the file.
+        // Do not leave empty space at the end.
         if !self.is_list()
             && rows.len() + 1 < visible
             && !loading
-            && self.top.record > Self::header_records(doc)
+            && rows.first().is_none_or(|r| r.index > 0)
         {
             let missing = (visible - 1 - rows.len()) as i64;
             let before = self.top;
@@ -708,8 +1300,23 @@ impl Grid {
             }
         }
         self.rows = rows;
+        self.cursor_index = if self.is_list() {
+            self.lcur as u64
+        } else {
+            doc.lnumber(&self.cursor)
+        };
+        if self.is_list()
+            && let Some(l) = self.list()
+            && let Some(r) = l.lock().rows.get(self.lcur)
+        {
+            self.cursor = doc.lpos_of(RowPos {
+                offset: r.offset,
+                record: r.record,
+                exact: true,
+            });
+        }
         self.loading = loading;
-        info.loading = loading;
+        self.out.loading = loading;
         if loading {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
@@ -738,42 +1345,41 @@ impl Grid {
         };
 
         let expected = doc.index().read().reference_fields;
-        let hdr = Self::header_records(doc);
-        let sel = self.selection();
+        let (s_r0, s_r1, s_c0, s_c1) = self.selection_box();
+        let has_sel = self.anchor.is_some();
         let char_px = font_size * 0.5;
-        // Alternate by visual row: list views skip records.
-        let first_visual = if self.is_list() {
-            self.ltop
-        } else {
-            self.top.record.saturating_sub(hdr) as usize
-        };
-        let stripe = |ri: usize| (first_visual + ri) % 2 == 1;
+        let stripe = |index: u64| index % 2 == 1;
 
         // Rows.
         let cell_painter = painter.with_clip_rect(cells_rect);
         let mut hovered: Option<(usize, usize)> = None;
+        let mut editor_rect: Option<Rect> = None;
         let pointer = ui.input(|i| i.pointer.hover_pos());
-        for (ri, (pos, rec)) in self.rows.iter().enumerate() {
+        let rows = std::mem::take(&mut self.rows);
+        for (ri, g) in rows.iter().enumerate() {
             let y = cells_rect.top() + ri as f32 * row_h - self.top_px;
             let row_rect =
                 Rect::from_min_size(pos2(cells_rect.left(), y), vec2(cells_rect.width(), row_h));
-            let ragged = expected.is_some_and(|e| rec.fields != 0 && rec.fields != e);
-            if stripe(ri) {
+            let span = g.row.span();
+            let ragged =
+                expected.is_some_and(|e| span.is_some_and(|s| s.fields != 0 && s.fields != e));
+            if stripe(g.index) {
                 cell_painter.rect_filled(row_rect, CornerRadius::ZERO, colors.stripe);
             }
             if ragged {
                 cell_painter.rect_filled(row_rect, CornerRadius::ZERO, colors.ragged);
             }
-            let ranges = [(0usize, frozen), (first_col, last_col)];
-            for (a, b) in ranges {
+            for (a, b) in [(0usize, frozen), (first_col, last_col)] {
                 if a >= b {
                     continue;
                 }
                 let max_chars =
                     ((self.cols.width(a).max(self.cols.width(b - 1)) / char_px) as usize + 2)
                         .clamp(8, 1000);
-                let cells = doc.cells(rec, a..b, max_chars).unwrap_or_default();
-                for (k, cell) in cells.iter().enumerate() {
+                let cells = doc
+                    .display_cells(&g.row, a..b, max_chars)
+                    .unwrap_or_default();
+                for (k, (cell, edited)) in cells.iter().enumerate() {
                     let c = a + k;
                     let x = col_screen_x(&self.cols, c);
                     let w = self.cols.width(c);
@@ -786,7 +1392,7 @@ impl Grid {
                         cell_painter.rect_filled(
                             rect,
                             CornerRadius::ZERO,
-                            if stripe(ri) {
+                            if stripe(g.index) {
                                 colors.stripe
                             } else {
                                 colors.background
@@ -796,12 +1402,7 @@ impl Grid {
                             cell_painter.rect_filled(rect, CornerRadius::ZERO, colors.ragged);
                         }
                     }
-                    if let Some(((r0, c0), (r1, c1))) = sel
-                        && pos.offset >= r0
-                        && pos.offset <= r1
-                        && c >= c0
-                        && c <= c1
-                    {
+                    if has_sel && g.index >= s_r0 && g.index <= s_r1 && c >= s_c0 && c <= s_c1 {
                         cell_painter.rect_filled(rect, CornerRadius::ZERO, colors.selection);
                     }
                     let marks = match &self.highlight {
@@ -819,12 +1420,22 @@ impl Grid {
                         self.cols.kind(c).is_numeric(),
                         &marks,
                     );
+                    if *edited {
+                        let tri = Rect::from_min_size(rect.min + vec2(1.0, 1.0), vec2(5.0, 5.0));
+                        cell_painter.rect_filled(tri, CornerRadius::ZERO, colors.edited);
+                    }
                     if pointer.is_some_and(|p| rect.contains(p) && cells_rect.contains(p)) {
                         hovered = Some((ri, c));
                     }
+                    if let Some(e) = &self.editor
+                        && e.row.pos == g.row.pos
+                        && e.col == c
+                    {
+                        editor_rect = Some(rect);
+                    }
                 }
             }
-            if pos.offset == self.cursor.offset {
+            if g.index == self.cursor_index && self.editor.is_none() {
                 let x0 = col_screen_x(&self.cols, self.cursor_col);
                 let r =
                     Rect::from_min_size(pos2(x0, y), vec2(self.cols.width(self.cursor_col), row_h));
@@ -836,7 +1447,8 @@ impl Grid {
                 );
             }
         }
-        info.painted_rows = self.rows.len();
+        self.rows = rows;
+        self.out.painted_rows = self.rows.len();
         if self.rows.is_empty() {
             let msg = if loading { "Loading…" } else { "(no rows)" };
             cell_painter.text(
@@ -884,49 +1496,38 @@ impl Grid {
         let header_painter = painter.with_clip_rect(header_rect);
         header_painter.rect_filled(header_rect, CornerRadius::ZERO, colors.header_bg);
         self.header_names.clear();
-        let header_rec = doc.header_record().ok().flatten();
         let header_font = FontId::new(font_size, egui::FontFamily::Proportional);
-        for (a, b) in [(0usize, frozen), (first_col, last_col)] {
-            if a >= b {
+        for c in (0..frozen).chain(first_col..last_col) {
+            let x = col_screen_x(&self.cols, c);
+            let w = self.cols.width(c);
+            let rect = Rect::from_min_size(pos2(x, full.top()), vec2(w, header_h));
+            if c >= frozen && rect.right() < cells_rect.left() + frozen_w {
                 continue;
             }
-            let names: Vec<Cell> = match &header_rec {
-                Some(h) => doc.cells(h, a..b, 200).unwrap_or_default(),
-                None => Vec::new(),
-            };
-            for c in a..b {
-                let x = col_screen_x(&self.cols, c);
-                let w = self.cols.width(c);
-                let rect = Rect::from_min_size(pos2(x, full.top()), vec2(w, header_h));
-                if c >= frozen && rect.right() < cells_rect.left() + frozen_w {
-                    continue;
-                }
-                if c < frozen {
-                    header_painter.rect_filled(rect, CornerRadius::ZERO, colors.header_bg);
-                }
-                let name = names
-                    .get(c - a)
-                    .filter(|n| !n.missing && !n.unknown)
-                    .map(|n| n.text.clone())
-                    .unwrap_or_else(|| format!("Column {}", c + 1));
-                let job = single_line(
-                    &name,
-                    header_font.clone(),
-                    colors.header_text,
-                    w - 2.0 * CELL_PAD,
-                );
-                let galley = header_painter.layout_job(job);
-                header_painter.galley(
-                    pos2(
-                        rect.left() + CELL_PAD,
-                        rect.center().y - galley.size().y * 0.5,
-                    ),
-                    galley,
-                    colors.header_text,
-                );
-                header_painter.vline(rect.right(), rect.y_range(), Stroke::new(1.0, colors.line));
-                self.header_names.push((c, name));
+            if c < frozen {
+                header_painter.rect_filled(rect, CornerRadius::ZERO, colors.header_bg);
             }
+            let name = doc
+                .column_name(c)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Column {}", c + 1));
+            let job = single_line(
+                &name,
+                header_font.clone(),
+                colors.header_text,
+                w - 2.0 * CELL_PAD,
+            );
+            let galley = header_painter.layout_job(job);
+            header_painter.galley(
+                pos2(
+                    rect.left() + CELL_PAD,
+                    rect.center().y - galley.size().y * 0.5,
+                ),
+                galley,
+                colors.header_text,
+            );
+            header_painter.vline(rect.right(), rect.y_range(), Stroke::new(1.0, colors.line));
+            self.header_names.push((c, name));
         }
         painter.hline(
             full.left()..=cells_rect.right(),
@@ -941,16 +1542,22 @@ impl Grid {
         );
         let gutter_painter = painter.with_clip_rect(gutter);
         gutter_painter.rect_filled(gutter, CornerRadius::ZERO, colors.gutter_bg);
-        for (ri, (pos, rec)) in self.rows.iter().enumerate() {
+        for (ri, g) in self.rows.iter().enumerate() {
             let y = cells_rect.top() + ri as f32 * row_h - self.top_px;
-            let n = pos.record - hdr + 1;
-            let label = if pos.exact {
+            let n = g.label + 1;
+            let inserted = matches!(g.row.kind, LKind::New(_));
+            let label = if inserted {
+                format!("+{}", group(n))
+            } else if g.exact {
                 group(n)
             } else {
                 format!("~{}", group(n))
             };
-            let ragged = expected.is_some_and(|e| rec.fields != 0 && rec.fields != e);
-            let color = if !pos.exact {
+            let ragged = expected
+                .is_some_and(|e| g.row.span().is_some_and(|s| s.fields != 0 && s.fields != e));
+            let color = if inserted {
+                colors.edited
+            } else if !g.exact {
                 colors.approximate
             } else if ragged {
                 Color32::from_rgb(0xE0, 0x8A, 0x1E)
@@ -976,7 +1583,6 @@ impl Grid {
         // Column resizing by dragging header borders.
         self.handle_header(
             ui,
-            doc,
             &response,
             header_rect,
             &col_screen_x,
@@ -991,6 +1597,19 @@ impl Grid {
                 let x = col_screen_x(&self.cols, c);
                 p.x >= x && p.x < x + self.cols.width(c)
             });
+            if let Some(c) = self.menu_col
+                && cells_rect.contains(p)
+            {
+                // Right-click in a cell also moves the cursor there.
+                self.cursor_col = c;
+            }
+            if let Some((ri, _)) = hovered
+                && let Some(g) = self.rows.get(ri).copied()
+                && !(self.anchor.is_some() && g.index >= s_r0 && g.index <= s_r1)
+            {
+                self.anchor = None;
+                self.set_cursor_row(&g);
+            }
         }
         if let Some(c) = self.menu_col {
             let name = self
@@ -999,66 +1618,257 @@ impl Grid {
                 .find(|(i, _)| *i == c)
                 .map(|(_, n)| n.clone())
                 .unwrap_or_default();
-            response.context_menu(|ui| self.column_menu(ui, c, &name));
+            response.context_menu(|ui| self.context_menu(ui, c, &name));
         }
 
         // Scrollbars.
         self.vscrollbar(ui, doc, full, cells_rect, colors);
         self.hscrollbar(ui, full, cells_rect, frozen_w, colors);
 
-        // Hover tooltip and double click.
+        // Clicks, double clicks and tooltips.
         if let Some((ri, c)) = hovered
-            && let Some((_, rec)) = self.rows.get(ri).copied()
+            && let Some(g) = self.rows.get(ri).copied()
+            && self.editor.is_none()
         {
-            if response.double_clicked() {
-                info.double_clicked = Some((rec, c));
-            }
             if response.clicked() {
                 let shift = ui.input(|i| i.modifiers.shift);
-                let pos = self.rows[ri].0;
                 if shift {
-                    self.anchor.get_or_insert((self.cursor, self.cursor_col));
+                    let m = self.cursor_mark();
+                    self.anchor.get_or_insert(m);
                 } else {
                     self.anchor = None;
                 }
-                self.cursor = pos;
+                self.set_cursor_row(&g);
                 self.cursor_col = c;
             }
+            if response.double_clicked() {
+                self.set_cursor_row(&g);
+                self.cursor_col = c;
+                if self.read_only {
+                    self.out.open_cell = Some((g.row, c));
+                } else {
+                    self.start_edit(doc, None);
+                }
+            }
             if !response.dragged() && ui.input(|i| i.pointer.time_since_last_movement() > 0.4) {
-                let tip = doc.field_value(&rec, c, TOOLTIP_CHARS * 4).ok().flatten();
-                if let Some((text, cut)) = tip
+                let tip = doc.value(&g.row, c, TOOLTIP_CHARS * 4).ok();
+                if let Some(text) = tip
                     && !text.is_empty()
                     && (text.chars().count() as f32 * char_px * 1.15 > self.cols.width(c)
                         || text.contains(['\n', '\r', '\t']))
                 {
                     let shown: String = text.chars().take(TOOLTIP_CHARS).collect();
-                    let more = cut || text.chars().count() > TOOLTIP_CHARS;
+                    let more = text.chars().count() > TOOLTIP_CHARS;
                     response.clone().on_hover_ui_at_pointer(|ui| {
                         ui.set_max_width(520.0);
                         ui.label(egui::RichText::new(shown).font(font.clone()));
                         if more {
-                            ui.weak("… (double-click to open the whole cell)");
+                            ui.weak("… (open the cell to see all of it)");
                         }
                     });
                 }
             }
         }
 
+        // The inline editor.
+        if let Some(rect) = editor_rect {
+            self.show_editor(ui, doc, rect, &font, visible);
+        } else if self.editor.is_some()
+            && !self
+                .rows
+                .iter()
+                .any(|g| Some(g.row.pos) == self.editor.as_ref().map(|e| e.row.pos))
+        {
+            // Scrolled away: keep the edit.
+            self.commit_edit(doc);
+        }
+
         if doc.cells_pending() {
             ui.ctx().request_repaint();
         }
-        info.cursor = Some(self.cursor);
-        info.cursor_col = self.cursor_col;
-        info.columns = ncols;
-        info.filter_column = self.filter_request.take();
-        info
+        self.out.cursor = Some(self.cursor);
+        self.out.cursor_row = if self.is_list() {
+            self.rows
+                .iter()
+                .find(|g| g.index == self.cursor_index)
+                .map_or(
+                    self.cursor.rec.record.saturating_sub(doc.header_records()),
+                    |g| g.label,
+                )
+        } else {
+            self.cursor_index
+        };
+        self.out.cursor_exact = self.cursor.rec.exact;
+        self.out.cursor_col = self.cursor_col;
+        self.out.columns = ncols;
+        self.out.editing = self.editor.is_some();
+        std::mem::take(&mut self.out)
     }
 
-    fn column_menu(&mut self, ui: &mut Ui, c: usize, name: &str) {
+    fn set_cursor_row(&mut self, g: &GRow) {
+        if self.is_list() {
+            self.lcur = g.index as usize;
+        }
+        self.cursor = g.row.pos;
+        self.cursor_index = g.index;
+    }
+
+    fn show_editor(
+        &mut self,
+        ui: &mut Ui,
+        doc: &mut Document,
+        rect: Rect,
+        font: &FontId,
+        visible: usize,
+    ) {
+        let Some(e) = &mut self.editor else { return };
+        // Keys that end editing are taken before the text field sees them.
+        let typing = e.typing;
+        let (enter, tab, esc, up, down, left, right, shift) = ui.input_mut(|i| {
+            let shift = i.modifiers.shift;
+            let m = i.modifiers;
+            (
+                i.consume_key(m, Key::Enter),
+                i.consume_key(m, Key::Tab),
+                i.consume_key(m, Key::Escape),
+                i.consume_key(m, Key::ArrowUp),
+                i.consume_key(m, Key::ArrowDown),
+                typing && i.consume_key(m, Key::ArrowLeft),
+                typing && i.consume_key(m, Key::ArrowRight),
+                shift,
+            )
+        });
+        if esc {
+            self.editor = None;
+            return;
+        }
+        let edit_rect = Rect::from_min_size(rect.min, vec2(rect.width().max(220.0), rect.height()));
+        let id = ui.scope_id().with("katak-cell-editor");
+        let r = ui.put(
+            edit_rect,
+            egui::TextEdit::singleline(&mut e.text)
+                .id(id)
+                .font(font.clone())
+                .margin(egui::Margin::symmetric(4, 2)),
+        );
+        if e.focus {
+            r.request_focus();
+            e.focus = false;
+        }
+        let moves: Option<(i64, i64)> = if enter {
+            Some((if shift { -1 } else { 1 }, 0))
+        } else if tab {
+            Some((0, if shift { -1 } else { 1 }))
+        } else if up {
+            Some((-1, 0))
+        } else if down {
+            Some((1, 0))
+        } else if left {
+            Some((0, -1))
+        } else if right {
+            Some((0, 1))
+        } else if r.lost_focus() {
+            Some((0, 0))
+        } else {
+            None
+        };
+        if let Some((dr, dc)) = moves {
+            self.commit_edit(doc);
+            if dr != 0 {
+                self.move_cursor(doc, dr);
+                self.ensure_cursor_visible(doc, visible);
+            }
+            if dc != 0 {
+                self.cursor_col = (self.cursor_col as i64 + dc)
+                    .clamp(0, self.cols.len().max(1) as i64 - 1)
+                    as usize;
+            }
+            ui.memory_mut(|m| m.request_focus(ui.scope_id().with("katak-grid")));
+        }
+    }
+
+    fn context_menu(&mut self, ui: &mut Ui, c: usize, name: &str) {
         ui.strong(format!("Column {}: {}", c + 1, name));
         ui.separator();
+        let ro = self.read_only;
+        if ui.button("Copy  Ctrl+C").clicked() {
+            self.actions.push(EditAction::Copy);
+            ui.close();
+        }
+        if ui
+            .add_enabled(!ro, egui::Button::new("Paste  Ctrl+V"))
+            .clicked()
+        {
+            // The clipboard arrives as a paste event; ask the app for it.
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            ui.close();
+        }
+        if ui
+            .add_enabled(!ro, egui::Button::new("Clear  Delete"))
+            .clicked()
+        {
+            self.actions.push(EditAction::Clear);
+            ui.close();
+        }
+        if ui
+            .add_enabled(!ro, egui::Button::new("Fill down  Ctrl+D"))
+            .clicked()
+        {
+            self.actions.push(EditAction::FillDown);
+            ui.close();
+        }
+        ui.separator();
+        ui.add_enabled_ui(!ro, |ui| {
+            ui.menu_button("Rows", |ui| {
+                if ui.button("Insert row above").clicked() {
+                    self.actions.push(EditAction::InsertRowAbove);
+                    ui.close();
+                }
+                if ui.button("Insert row below").clicked() {
+                    self.actions.push(EditAction::InsertRowBelow);
+                    ui.close();
+                }
+                if ui.button("Delete selected rows").clicked() {
+                    self.actions.push(EditAction::DeleteRows);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Column", |ui| {
+                if ui.button("Rename…").clicked() {
+                    self.out.rename_column = Some(c);
+                    ui.close();
+                }
+                if ui.button("Insert column left").clicked() {
+                    self.cursor_col = c;
+                    self.actions.push(EditAction::InsertColumnLeft);
+                    ui.close();
+                }
+                if ui.button("Insert column right").clicked() {
+                    self.cursor_col = c;
+                    self.actions.push(EditAction::InsertColumnRight);
+                    ui.close();
+                }
+                if ui.button("Move left").clicked() {
+                    self.cursor_col = c;
+                    self.actions.push(EditAction::MoveColumnLeft);
+                    ui.close();
+                }
+                if ui.button("Move right").clicked() {
+                    self.cursor_col = c;
+                    self.actions.push(EditAction::MoveColumnRight);
+                    ui.close();
+                }
+                if ui.button("Delete column").clicked() {
+                    self.cursor_col = c;
+                    self.actions.push(EditAction::DeleteColumn);
+                    ui.close();
+                }
+            });
+        });
+        ui.separator();
         if ui.button("Filter this column…").clicked() {
-            self.filter_request = Some(c);
+            self.out.filter_column = Some(c);
             ui.close();
         }
         if ui.button("Auto-fit width").clicked() {
@@ -1073,23 +1883,23 @@ impl Grid {
             self.frozen = 0;
             ui.close();
         }
-        ui.separator();
-        let inferred = self.cols.types.get(c).copied().unwrap_or_default();
-        let current = self.cols.type_overrides.get(c).copied().flatten();
-        ui.label("Type (alignment and sort order only)");
-        if ui
-            .radio(current.is_none(), format!("Auto ({inferred})"))
-            .clicked()
-        {
-            self.cols.set_override(c, None);
-            ui.close();
-        }
-        for t in ColumnType::ALL {
-            if ui.radio(current == Some(t), t.label()).clicked() {
-                self.cols.set_override(c, Some(t));
+        ui.menu_button("Type (alignment and sort order only)", |ui| {
+            let inferred = self.cols.types.get(c).copied().unwrap_or_default();
+            let current = self.cols.type_overrides.get(c).copied().flatten();
+            if ui
+                .radio(current.is_none(), format!("Auto ({inferred})"))
+                .clicked()
+            {
+                self.cols.set_override(c, None);
                 ui.close();
             }
-        }
+            for t in ColumnType::ALL {
+                if ui.radio(current == Some(t), t.label()).clicked() {
+                    self.cols.set_override(c, Some(t));
+                    ui.close();
+                }
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1137,23 +1947,11 @@ impl Grid {
         }
     }
 
-    /// Normalized selection: ((row offset lo, col lo), (row offset hi, col hi)).
-    fn selection(&self) -> Option<((u64, usize), (u64, usize))> {
-        let (a, ac) = self.anchor?;
-        let (r0, r1) = if a.offset <= self.cursor.offset {
-            (a.offset, self.cursor.offset)
-        } else {
-            (self.cursor.offset, a.offset)
-        };
-        Some(((r0, ac.min(self.cursor_col)), (r1, ac.max(self.cursor_col))))
-    }
-
     fn handle_input(
         &mut self,
         ui: &mut Ui,
         response: &Response,
         doc: &mut Document,
-        row_h: f32,
         visible: usize,
         cells: Rect,
     ) {
@@ -1178,69 +1976,109 @@ impl Grid {
         let mut moved_col = false;
         let events = ui.input(|i| i.events.clone());
         for e in events {
-            let egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } = e
-            else {
-                continue;
-            };
-            let extend = modifiers.shift;
-            let before = (self.cursor, self.cursor_col);
-            let ctrl = modifiers.command;
-            match key {
-                Key::ArrowDown => {
-                    self.move_cursor(doc, 1);
-                    moved = true;
+            match e {
+                egui::Event::Copy => self.actions.push(EditAction::Copy),
+                egui::Event::Cut => self.actions.push(EditAction::Cut),
+                egui::Event::Paste(text) => self.actions.push(EditAction::Paste(text)),
+                egui::Event::Text(t) if !t.chars().any(char::is_control) => {
+                    let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                    if !ctrl {
+                        self.start_edit(doc, Some(t));
+                        return;
+                    }
                 }
-                Key::ArrowUp => {
-                    self.move_cursor(doc, -1);
-                    moved = true;
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    let before = self.cursor_mark();
+                    let extend = modifiers.shift;
+                    let ctrl = modifiers.command;
+                    match key {
+                        Key::ArrowDown => {
+                            self.move_cursor(doc, 1);
+                            moved = true;
+                        }
+                        Key::ArrowUp => {
+                            self.move_cursor(doc, -1);
+                            moved = true;
+                        }
+                        Key::Enter => {
+                            self.move_cursor(doc, if extend { -1 } else { 1 });
+                            self.anchor = None;
+                            moved = true;
+                            continue;
+                        }
+                        Key::PageDown => {
+                            self.move_cursor(doc, page);
+                            self.move_top(doc, page);
+                            moved = true;
+                        }
+                        Key::PageUp => {
+                            self.move_cursor(doc, -page);
+                            self.move_top(doc, -page);
+                            moved = true;
+                        }
+                        Key::ArrowRight | Key::Tab if !(key == Key::Tab && modifiers.shift) => {
+                            self.cursor_col = (self.cursor_col + 1).min(ncols - 1);
+                            moved_col = true;
+                        }
+                        Key::ArrowLeft | Key::Tab => {
+                            self.cursor_col = self.cursor_col.saturating_sub(1);
+                            moved_col = true;
+                        }
+                        Key::Home if ctrl => {
+                            self.commands.push(GridCommand::Top);
+                            self.cursor_col = 0;
+                            moved_col = true;
+                        }
+                        Key::End if ctrl => {
+                            self.commands.push(GridCommand::Bottom);
+                            moved_col = true;
+                        }
+                        Key::Home => {
+                            self.cursor_col = 0;
+                            moved_col = true;
+                        }
+                        Key::End => {
+                            self.cursor_col = ncols - 1;
+                            moved_col = true;
+                        }
+                        Key::F2 => {
+                            self.actions.push(EditAction::StartEdit);
+                            continue;
+                        }
+                        Key::Delete => {
+                            self.actions.push(EditAction::Clear);
+                            continue;
+                        }
+                        Key::Backspace => {
+                            self.start_edit(doc, Some(String::new()));
+                            return;
+                        }
+                        Key::D if ctrl => {
+                            self.actions.push(EditAction::FillDown);
+                            continue;
+                        }
+                        Key::A if ctrl => {
+                            self.actions.push(EditAction::SelectAll);
+                            continue;
+                        }
+                        Key::Escape => {
+                            self.anchor = None;
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                    if extend && key != Key::Tab {
+                        self.anchor.get_or_insert(before);
+                    } else {
+                        self.anchor = None;
+                    }
                 }
-                Key::PageDown => {
-                    self.move_cursor(doc, page);
-                    self.move_top(doc, page);
-                    moved = true;
-                }
-                Key::PageUp => {
-                    self.move_cursor(doc, -page);
-                    self.move_top(doc, -page);
-                    moved = true;
-                }
-                Key::ArrowRight | Key::Tab if !(key == Key::Tab && modifiers.shift) => {
-                    self.cursor_col = (self.cursor_col + 1).min(ncols - 1);
-                    moved_col = true;
-                }
-                Key::ArrowLeft | Key::Tab => {
-                    self.cursor_col = self.cursor_col.saturating_sub(1);
-                    moved_col = true;
-                }
-                Key::Home if ctrl => {
-                    self.commands.push(GridCommand::Top);
-                    self.cursor_col = 0;
-                    moved_col = true;
-                }
-                Key::End if ctrl => {
-                    self.commands.push(GridCommand::Bottom);
-                    moved_col = true;
-                }
-                Key::Home => {
-                    self.cursor_col = 0;
-                    moved_col = true;
-                }
-                Key::End => {
-                    self.cursor_col = ncols - 1;
-                    moved_col = true;
-                }
-                Key::Escape => self.anchor = None,
-                _ => continue,
-            }
-            if extend && key != Key::Tab {
-                self.anchor.get_or_insert(before);
-            } else if key != Key::Escape {
-                self.anchor = None;
+                _ => {}
             }
         }
         if moved {
@@ -1249,7 +2087,6 @@ impl Grid {
         if moved_col {
             self.ensure_col_visible(cells.width());
         }
-        let _ = row_h;
     }
 
     fn ensure_col_visible(&mut self, view_w: f32) {
@@ -1273,7 +2110,6 @@ impl Grid {
     fn handle_header(
         &mut self,
         ui: &mut Ui,
-        doc: &mut Document,
         grid: &Response,
         header: Rect,
         col_x: &dyn Fn(&Columns, usize) -> f32,
@@ -1322,7 +2158,7 @@ impl Grid {
             }
             return;
         }
-        // Click on a header cell selects the column's cell at the cursor row.
+        // Click on a header cell moves the cursor to that column.
         if grid.clicked()
             && let Some(p) = pointer
             && header.contains(p)
@@ -1334,7 +2170,6 @@ impl Grid {
                 }
             }
         }
-        let _ = doc;
     }
 
     fn vscrollbar(
@@ -1363,12 +2198,14 @@ impl Grid {
                 )
             }
             None => {
-                let frac =
-                    ((self.top.offset.saturating_sub(a)) as f64 / span).clamp(0.0, 1.0) as f32;
+                let top = self.top.rec.offset;
+                let frac = ((top.saturating_sub(a)) as f64 / span).clamp(0.0, 1.0) as f32;
                 let shown = self
                     .rows
-                    .last()
-                    .map_or(0, |r| r.1.end.saturating_sub(self.top.offset));
+                    .iter()
+                    .rev()
+                    .find_map(|g| g.row.span())
+                    .map_or(0, |s| s.end.saturating_sub(top));
                 (frac, (shown as f64 / span).clamp(0.0, 1.0) as f32)
             }
         };
@@ -1511,6 +2348,68 @@ impl Grid {
     }
 }
 
+/// Appends a value as a TSV field (Excel-compatible quoting).
+fn tsv_field(v: &str, out: &mut String) {
+    if v.contains(['\t', '\n', '\r', '"']) {
+        out.push('"');
+        out.push_str(&v.replace('"', "\"\""));
+        out.push('"');
+    } else {
+        out.push_str(v);
+    }
+}
+
+/// Parses TSV as Excel writes it to the clipboard: tab-separated fields,
+/// one row per line, quoted fields may contain tabs, line breaks and `""`.
+pub fn parse_tsv(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut chars = text.chars().peekable();
+    let mut at_start = true;
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' if at_start => {
+                quoted = true;
+                at_start = false;
+            }
+            '\t' => {
+                row.push(std::mem::take(&mut field));
+                at_start = true;
+            }
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\n' | '\r' => {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+                at_start = true;
+            }
+            c => {
+                field.push(c);
+                at_start = false;
+            }
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
 /// A single-line layout job elided with `…` at `max_width`.
 pub fn single_line(text: &str, font: FontId, color: Color32, max_width: f32) -> LayoutJob {
     let mut job = LayoutJob::single_section(text.to_string(), TextFormat::simple(font, color));
@@ -1560,14 +2459,6 @@ pub fn highlighted_line(
     job
 }
 
-fn list_pos(r: Row) -> RowPos {
-    RowPos {
-        offset: r.offset,
-        record: r.record,
-        exact: true,
-    }
-}
-
 /// `1234567` -> `1,234,567`.
 pub fn group(n: u64) -> String {
     let s = n.to_string();
@@ -1602,5 +2493,36 @@ mod tests {
         assert_eq!(c.x(0), 0.0);
         assert_eq!(c.x(2), (DEFAULT_COL_WIDTH + 50.0) as f64);
         assert_eq!(c.at_x(DEFAULT_COL_WIDTH as f64 + 10.0), 1);
+    }
+
+    #[test]
+    fn tsv_roundtrip() {
+        let values = [
+            vec!["a", "b\tc", "say \"hi\""],
+            vec!["multi\nline", "", "x"],
+        ];
+        let mut text = String::new();
+        for row in &values {
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    text.push('\t');
+                }
+                tsv_field(v, &mut text);
+            }
+            text.push('\n');
+        }
+        let parsed = parse_tsv(&text);
+        assert_eq!(
+            parsed,
+            values
+                .iter()
+                .map(|r| r.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parse_tsv("1\t2\r\n3\t4"),
+            vec![vec!["1", "2"], vec!["3", "4"]]
+        );
+        assert!(parse_tsv("").is_empty());
     }
 }
