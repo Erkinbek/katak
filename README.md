@@ -58,7 +58,7 @@ that are too big for everything else:
 
 | Platform | Download |
 |----------|----------|
-| Windows 10 / 11 (x64) | [Portable .exe](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.exe) · [Installer](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64-setup.exe) |
+| Windows 10 / 11 (x64) | [Installer](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64-setup.exe) · [Portable .exe](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.exe) · [MSI](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.msi) for IT deployment |
 | macOS, Apple Silicon | [katak-macos-arm64.tar.gz](https://github.com/Erkinbek/katak/releases/latest/download/katak-macos-arm64.tar.gz) |
 | macOS, Intel | [katak-macos-x64.tar.gz](https://github.com/Erkinbek/katak/releases/latest/download/katak-macos-x64.tar.gz) |
 | Linux x64 (glibc 2.35+) | [katak-linux-x64.tar.gz](https://github.com/Erkinbek/katak/releases/latest/download/katak-linux-x64.tar.gz) |

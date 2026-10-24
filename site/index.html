@@ -339,9 +339,10 @@ footer a { color: var(--muted); }
       <div class="downloads">
         <div class="card">
           <h3>Windows 10 / 11</h3>
-          <p>Portable .exe, or an installer that adds "Open with" for .csv, .tsv and .txt.</p>
-          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.exe">Portable katak.exe (x64)</a>
+          <p>Installer with Start menu entry and "Open with" for .csv, .tsv and .txt, a portable .exe, or an MSI for IT deployment.</p>
           <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64-setup.exe">Installer (x64)</a>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.exe">Portable katak.exe (x64)</a>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.msi">MSI package (Group Policy, Intune)</a>
         </div>
         <div class="card">
           <h3>macOS</h3>
@@ -410,7 +411,7 @@ footer a { color: var(--muted); }
   var button = document.getElementById("download-button");
   if (/Android|iPhone|iPad|iPod/i.test(ua)) return;
   if (/Win/i.test(platform) || /Windows/i.test(ua)) {
-    button.href = base + "katak-windows-x64.exe";
+    button.href = base + "katak-windows-x64-setup.exe";
     button.textContent = "Download for Windows";
   } else if (/Mac/i.test(platform) || /Mac OS X/i.test(ua)) {
     button.textContent = "Download for macOS";

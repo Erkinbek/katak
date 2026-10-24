@@ -1,5 +1,5 @@
 ; Inno Setup script for the optional Katak installer.
-; Build: ISCC.exe /DAppVersion=0.5.0 /DSourceExe=path\to\katak.exe katak.iss
+; Build: ISCC.exe /DAppVersion=0.5.1 /DSourceExe=path\to\katak.exe katak.iss
 ; The portable katak.exe works without installing; the installer only adds
 ; a Start menu entry, an uninstaller and "Open with" registration.
 
@@ -19,12 +19,19 @@ AppPublisherURL=https://github.com/Erkinbek/katak
 AppSupportURL=https://github.com/Erkinbek/katak/issues
 AppUpdatesURL=https://github.com/Erkinbek/katak/releases
 LicenseFile=..\..\LICENSE
+SetupIconFile=..\..\crates\katak\assets\katak.ico
+VersionInfoVersion={#AppVersion}
+VersionInfoProductName=Katak
+VersionInfoDescription=Katak installer
 DefaultDirName={autopf}\Katak
-DefaultGroupName=Katak
+DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\katak.exe
 OutputBaseFilename=katak-setup
 Compression=lzma2
 SolidCompression=yes
+; Rust programs need Windows 10 or later; x64compatible also allows
+; Windows 11 on ARM (x64 emulation).
+MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequiredOverridesAllowed=dialog
@@ -39,8 +46,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "katak.exe"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Katak"; Filename: "{app}\katak.exe"
-Name: "{group}\Uninstall Katak"; Filename: "{uninstallexe}"
+; Directly in the Start menu, no folder (uninstalling is in Settings ->
+; Apps, as for any Windows 10/11 app).
+Name: "{autoprograms}\Katak"; Filename: "{app}\katak.exe"
 Name: "{autodesktop}\Katak"; Filename: "{app}\katak.exe"; Tasks: desktopicon
 
 [Registry]
