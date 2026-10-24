@@ -116,6 +116,23 @@ pub struct Scanner<'d> {
     long_reported: bool,
     comment_start: u64,
     unterminated: Option<u64>,
+    /// Bytes that end an unquoted run on the generic 1-byte path.
+    special: [bool; 256],
+    /// Mode entered after a record ends.
+    after_record: Mode,
+}
+
+fn special_bytes(d: &Compiled) -> [bool; 256] {
+    let mut t = [false; 256];
+    t[b'\n' as usize] = true;
+    t[b'\r' as usize] = true;
+    if d.whitespace {
+        t[b' ' as usize] = true;
+        t[b'\t' as usize] = true;
+    } else if let Some(&first) = d.delim.first() {
+        t[(first & 0xFF) as usize] = true;
+    }
+    t
 }
 
 impl<'d> Scanner<'d> {
@@ -133,6 +150,20 @@ impl<'d> Scanner<'d> {
             long_reported: false,
             comment_start: 0,
             unterminated: None,
+            special: special_bytes(d),
+            after_record: Self::after_record_mode(d, !d.fast),
+        }
+    }
+
+    /// Without comments nothing needs deciding at a record start: go
+    /// straight to the first field.
+    fn after_record_mode(d: &Compiled, generic: bool) -> Mode {
+        if !d.comment.is_empty() {
+            Mode::RecStart
+        } else if generic {
+            Mode::FieldStart
+        } else {
+            Mode::Unquoted
         }
     }
 
@@ -140,6 +171,7 @@ impl<'d> Scanner<'d> {
     #[doc(hidden)]
     pub fn force_generic(mut self) -> Self {
         self.generic = true;
+        self.after_record = Self::after_record_mode(self.d, true);
         self
     }
 
@@ -198,7 +230,8 @@ impl<'d> Scanner<'d> {
             fields: self.delims + 1,
             term,
         };
-        self.mode = Mode::RecStart;
+        self.mode = self.after_record;
+        self.rec_start = end;
         self.delims = 0;
         self.prev_delim = false;
         if sink.record(&rec) == Flow::Stop {
@@ -214,6 +247,8 @@ impl<'d> Scanner<'d> {
             Mode::Comment => {
                 sink.comment(self.comment_start, end);
             }
+            // Nothing after the last terminator: no record.
+            _ if self.rec_start >= end => {}
             mode => {
                 if mode == Mode::Quoted {
                     self.unterminated = Some(self.quote_start);
@@ -344,13 +379,31 @@ impl<'d> Scanner<'d> {
                     }
                 },
                 Mode::Unquoted => {
-                    let hay = &buf[p..];
-                    let hit = match quote {
-                        Some(q) => memchr3(q, b'\n', b'\r', hay),
-                        None => memchr2(b'\n', b'\r', hay),
+                    // Records are often short: a few scalar steps beat the
+                    // setup cost of the SIMD searches.
+                    let probe_end = (p + 16).min(len);
+                    let qb = quote.unwrap_or(b'\n');
+                    let mut k = p;
+                    while k < probe_end {
+                        let b = buf[k];
+                        if b == b'\n' || b == b'\r' || b == qb {
+                            break;
+                        }
+                        self.delims += (b == delim) as u64;
+                        k += 1;
+                    }
+                    let hit = if k < probe_end {
+                        Some(k - p)
+                    } else {
+                        let hay = &buf[k..];
+                        let found = match quote {
+                            Some(q) => memchr3(q, b'\n', b'\r', hay),
+                            None => memchr2(b'\n', b'\r', hay),
+                        };
+                        let seg_end = found.map_or(len, |i| k + i);
+                        self.delims += bytecount::count(&buf[k..seg_end], delim) as u64;
+                        found.map(|i| k + i - p)
                     };
-                    let seg_end = hit.map_or(len, |i| p + i);
-                    self.delims += bytecount::count(&buf[p..seg_end], delim) as u64;
                     let Some(i) = hit else {
                         self.pos = base + len as u64;
                         return if eof {
@@ -550,6 +603,15 @@ impl<'d> Scanner<'d> {
                     }
                 }
                 Mode::Unquoted | Mode::AfterQuoted => {
+                    if w == 1 && !self.special[(u & 0xFF) as usize] {
+                        // Skip a run of ordinary bytes in one go.
+                        let mut q = p + 1;
+                        while q < full && !self.special[buf[q] as usize] {
+                            q += 1;
+                        }
+                        p = q;
+                        continue;
+                    }
                     if self.d.whitespace {
                         if is_blank(u) {
                             self.mode = Mode::Blanks;
@@ -567,6 +629,9 @@ impl<'d> Scanner<'d> {
                 Mode::Blanks => {
                     if is_blank(u) {
                         p += w;
+                        while w == 1 && p < full && (buf[p] == b' ' || buf[p] == b'\t') {
+                            p += 1;
+                        }
                     } else if u == LF || u == CR {
                         // Trailing blanks are not a separator.
                         self.mode = Mode::Unquoted;

@@ -277,8 +277,10 @@ pub fn detect(sample: &[u8], whole_file: bool) -> DetectedEncoding {
             evidence: EncodingEvidence::ValidUtf8,
         };
     }
+    // chardetng is accurate on far less than a megabyte and costs ~50 ms/MB.
+    let head = &sample[..sample.len().min(256 << 10)];
     let mut det = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
-    det.feed(sample, whole_file);
+    det.feed(head, whole_file && head.len() == sample.len());
     let guess = det.guess(None, chardetng::Utf8Detection::Deny);
     DetectedEncoding {
         encoding: TextEncoding::from_encoding_rs(guess),

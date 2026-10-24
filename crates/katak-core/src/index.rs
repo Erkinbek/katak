@@ -18,8 +18,6 @@ use crate::source::{ChunkReader, Source};
 
 /// Target distance between checkpoints.
 pub const CHECKPOINT_SPACING: u64 = 64 * 1024;
-/// Ragged record offsets kept for "jump to next ragged row".
-pub const RAGGED_CAP: usize = 1 << 20;
 const WARNING_CAP: usize = 64;
 const CHUNK: usize = 16 << 20;
 
@@ -108,8 +106,9 @@ pub struct IndexData {
     pub reference_fields: Option<u64>,
     pub max_fields: u64,
     pub ragged_count: u64,
-    /// Offsets of ragged records (at most [`RAGGED_CAP`]).
-    pub ragged: Vec<u64>,
+    /// Bit `i` is set when checkpoint block `i` contains a ragged record
+    /// (one bit per ~64 KB, so it stays tiny for any file size).
+    pub ragged_blocks: Vec<u64>,
     pub line_endings: LineEndings,
     pub comment_lines: u64,
     pub warnings: Vec<IndexWarning>,
@@ -176,9 +175,23 @@ impl IndexData {
         self.frontier.offset.saturating_sub(self.data_start)
     }
 
+    /// First block at or after `from` that contains a ragged record.
+    pub fn next_ragged_block(&self, from: usize) -> Option<usize> {
+        let mut word = from / 64;
+        let mut bits = *self.ragged_blocks.get(word)? & (!0u64 << (from % 64));
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize);
+            }
+            word += 1;
+            bits = *self.ragged_blocks.get(word)?;
+        }
+    }
+
     /// Heap memory used by the index.
     pub fn heap_bytes(&self) -> usize {
-        self.checkpoints.capacity() * std::mem::size_of::<Checkpoint>() + self.ragged.capacity() * 8
+        self.checkpoints.capacity() * std::mem::size_of::<Checkpoint>()
+            + self.ragged_blocks.capacity() * 8
     }
 }
 
@@ -218,42 +231,61 @@ struct IndexSink {
     reference_fields: Option<u64>,
     max_fields: u64,
     ragged_count: u64,
-    ragged_listed: usize,
-    new_ragged: Vec<u64>,
+    /// Checkpoints pushed so far (the current block is `blocks - 1`).
+    blocks: usize,
+    ragged_blocks: Vec<u64>,
     line_endings: LineEndings,
     comment_lines: u64,
     new_warnings: Vec<IndexWarning>,
     warnings: usize,
 }
 
-impl Sink for IndexSink {
-    #[inline]
-    fn record(&mut self, r: &RecSpan) -> Flow {
-        let big = r.end - r.start >= CHECKPOINT_SPACING;
-        if (r.start >= self.next_checkpoint_at || big) && self.last_checkpoint != Some(r.start) {
+impl IndexSink {
+    #[cold]
+    #[inline(never)]
+    fn checkpoint(&mut self, r: &RecSpan, big: bool) {
+        if self.last_checkpoint != Some(r.start) {
             self.new_checkpoints.push(Checkpoint {
                 offset: r.start,
                 record: self.records,
             });
             self.last_checkpoint = Some(r.start);
             self.next_checkpoint_at = r.start + CHECKPOINT_SPACING;
+            self.blocks += 1;
         }
         if big {
             // The next record gets a checkpoint too: this one is alone in its block.
             self.next_checkpoint_at = r.end;
         }
-        self.records += 1;
-        match self.reference_fields {
-            None => self.reference_fields = Some(r.fields),
-            Some(n) if n != r.fields => {
-                self.ragged_count += 1;
-                if self.ragged_listed < RAGGED_CAP {
-                    self.ragged_listed += 1;
-                    self.new_ragged.push(r.start);
-                }
-            }
-            Some(_) => {}
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unusual_width(&mut self, r: &RecSpan) {
+        if self.reference_fields.is_none() {
+            self.reference_fields = Some(r.fields);
+            return;
         }
+        self.ragged_count += 1;
+        let b = self.blocks - 1;
+        if self.ragged_blocks.len() <= b / 64 {
+            self.ragged_blocks.resize(b / 64 + 1, 0);
+        }
+        self.ragged_blocks[b / 64] |= 1 << (b % 64);
+    }
+}
+
+impl Sink for IndexSink {
+    #[inline]
+    fn record(&mut self, r: &RecSpan) -> Flow {
+        let big = r.end - r.start >= CHECKPOINT_SPACING;
+        if r.start >= self.next_checkpoint_at || big {
+            self.checkpoint(r, big);
+        }
+        if self.reference_fields != Some(r.fields) {
+            self.unusual_width(r);
+        }
+        self.records += 1;
         self.max_fields = self.max_fields.max(r.fields);
         self.line_endings.add(r.term);
         Flow::Continue
@@ -289,8 +321,8 @@ pub fn build(src: &Source, d: &Compiled, index: &Index, ctl: &JobCtl) -> Result<
         reference_fields: None,
         max_fields: 0,
         ragged_count: 0,
-        ragged_listed: 0,
-        new_ragged: Vec::new(),
+        blocks: 0,
+        ragged_blocks: Vec::new(),
         line_endings: LineEndings::default(),
         comment_lines: 0,
         new_warnings: Vec::new(),
@@ -321,7 +353,15 @@ pub fn build(src: &Source, d: &Compiled, index: &Index, ctl: &JobCtl) -> Result<
             g.reference_fields = sink.reference_fields;
             g.max_fields = sink.max_fields;
             g.ragged_count = sink.ragged_count;
-            g.ragged.append(&mut sink.new_ragged);
+            // Only the last word can have changed since the previous batch.
+            let keep = g
+                .ragged_blocks
+                .len()
+                .saturating_sub(1)
+                .min(sink.ragged_blocks.len());
+            g.ragged_blocks.truncate(keep);
+            g.ragged_blocks
+                .extend_from_slice(&sink.ragged_blocks[keep..]);
             g.line_endings = sink.line_endings;
             g.comment_lines = sink.comment_lines;
             g.warnings.append(&mut sink.new_warnings);

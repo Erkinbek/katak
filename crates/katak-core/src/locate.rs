@@ -27,7 +27,8 @@ const RESYNC_WINDOW: usize = 1 << 20;
 const RESYNC_CANDIDATES: usize = 256;
 const RESYNC_PROBE: usize = 8;
 const PROBE_BYTES: usize = 256 << 10;
-const BLOCK_CACHE: usize = 64;
+/// Records kept in the block cache (~40 bytes each).
+const BLOCK_CACHE_RECORDS: usize = 256 << 10;
 const SINGLE_RECORD_SYNTH: u64 = 1 << 20;
 
 /// A record position. `record` counts from 0 (the header, if any).
@@ -70,6 +71,7 @@ pub struct Locator {
     /// indexer has seen anything.
     sample_avg: Option<f64>,
     blocks: Vec<(usize, Arc<Vec<RecSpan>>, u64)>,
+    cached_records: usize,
     tick: u64,
 }
 
@@ -124,6 +126,7 @@ impl Locator {
             expected_fields,
             sample_avg,
             blocks: Vec::new(),
+            cached_records: 0,
             tick: 0,
         }
     }
@@ -245,15 +248,15 @@ impl Locator {
         };
         let recs = Arc::new(recs);
         if is_final {
-            if self.blocks.len() >= BLOCK_CACHE
-                && let Some(old) = self
+            self.cached_records += recs.len();
+            while self.cached_records > BLOCK_CACHE_RECORDS && !self.blocks.is_empty() {
+                let old = self
                     .blocks
                     .iter()
                     .enumerate()
                     .min_by_key(|(_, e)| e.2)
-                    .map(|(k, _)| k)
-            {
-                self.blocks.swap_remove(old);
+                    .map_or(0, |(k, _)| k);
+                self.cached_records -= self.blocks.swap_remove(old).1.len();
             }
             self.blocks.push((i, recs.clone(), self.tick));
         }
@@ -603,6 +606,42 @@ impl Locator {
             return self.locate_offset(pos.offset);
         }
         Ok(pos)
+    }
+
+    /// The first ragged record (field count differs from record 0) after
+    /// record `after`, searching the indexed region only.
+    pub fn next_ragged(&mut self, after: u64) -> io::Result<Option<RowPos>> {
+        let (start_block, reference) = {
+            let g = self.index.read();
+            (g.block_of_record(after), g.reference_fields)
+        };
+        let (Some(mut from), Some(reference)) = (start_block, reference) else {
+            return Ok(None);
+        };
+        loop {
+            let next = {
+                let g = self.index.read();
+                g.next_ragged_block(from).map(|i| {
+                    let (a, b) = g.block(i);
+                    (i, a, b, g.block_is_final(i))
+                })
+            };
+            let Some((i, a, b, fin)) = next else {
+                return Ok(None);
+            };
+            let recs = self.block_records(i, a, b, fin)?;
+            for (j, r) in recs.iter().enumerate() {
+                let rec = a.record + j as u64;
+                if rec > after && r.fields != 0 && r.fields != reference {
+                    return Ok(Some(RowPos {
+                        offset: r.start,
+                        record: rec,
+                        exact: true,
+                    }));
+                }
+            }
+            from = i + 1;
+        }
     }
 
     /// The last record, if there is any.
