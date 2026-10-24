@@ -270,7 +270,7 @@ fn convert_bench(
     };
     let mut scopes: Vec<(&str, Scope)> = vec![("whole file to TSV + CRLF", Scope::All)];
     if let Some(l) = sorted {
-        scopes.push(("sorted rows (random reads) to TSV", Scope::List(l)));
+        scopes.push(("in sort order to TSV", Scope::List(l)));
     }
     for (name, scope) in scopes {
         let input = ExportInput {

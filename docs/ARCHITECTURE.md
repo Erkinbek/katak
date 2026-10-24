@@ -235,8 +235,12 @@ struct Overlay {
 The grid shows one of:
 
 * **Natural**: logical rows in file order (positions from `locate`).
-* **List**: an explicit `RowRef` list — filter results (growing while the
-  filter runs) or a sort permutation. Scrolling is by list index.
+* **List**: an explicit list of `(offset, record)` rows — filter results
+  (file order, growing while the filter runs) or a sort permutation (sort
+  order, shown when the sort has finished). Scrolling is by list index; the
+  gutter shows original row numbers. Jumps (go to row/offset, F3) bisect a
+  file-order list and scan a permutation. A sort of a filtered view sorts
+  the filter's rows; changing the filter re-sorts its new rows.
 
 ## 11. Threading model
 
@@ -268,13 +272,29 @@ The grid shows one of:
 * **Filter**: AND of per-column predicates (contains, equals, starts with,
   regex, empty, not empty, numeric range); produces a capped `RowRef` list
   that the grid shows live ("N of ~M rows match").
-* **Replace all**: up to a threshold (default 50,000 cells) becomes one
-  compound overlay op (undoable); above it, a streaming rewrite to a temp file
-  (no undo, optional backup) followed by an atomic replace.
-* **Sort**: (key, offset) pairs, key = numeric value or 8-byte prefix with
-  tie-break re-reading the full value; parallel sort; result is a permutation
-  view. Allowed when `rows × 8` fits the budget (default 512 MB). The file is
-  only reordered by an explicit "save with sort order".
+* **Replace** (Ctrl+H): "Replace" rewrites the matches in the cursor's cell
+  and moves to the next match. **Replace all** runs a planning job (search
+  prefilter, exact match per decoded cell, `$1` / `${name}` capture groups
+  for regexes) that collects the new values. Up to a threshold (50,000
+  cells) they become one undoable overlay step; only cells that already had
+  an edit need their source value read (to drop edits that restore it).
+  Above the threshold the user is offered a streaming rewrite instead: one
+  pass that re-assembles only records with a match and copies everything
+  else verbatim, into a temp file that replaces the original atomically
+  (not undoable, `.bak` offered, unsaved edits must be saved first).
+* **Sort**: one entry per row, `(key, fingerprint, offset, record)` = 32
+  bytes, collected in one sequential pass into a vector sized from the row
+  count (no doubling) and sorted in parallel. Numbers (`.` or `,` decimals)
+  and dates sort by an exact 8-byte key; values that do not parse sort
+  last; ties keep file order. Text sorts by its first 8 bytes; a run of
+  equal prefixes is grouped by a 64-bit fingerprint of the whole value, one
+  value per group is re-read (in file order) and the groups are ordered by
+  those values — a column with few distinct long values costs a few reads,
+  not one per row. The entries are then turned into the `(offset, record)`
+  list in place (the allocation is reused). The memory budget (default
+  512 MB, View → Sort memory budget) is checked up front and enforced
+  while collecting. The file is never reordered; Export writes the sort
+  order ("Save sorted as…").
 
 ## 13. Save and export (`save`, `write`)
 
@@ -293,9 +313,21 @@ The grid shows one of:
   is a hard link to the original (copy if links are unsupported). Any failure
   leaves the original untouched and maps OS errors (sharing violation, access
   denied, read-only, disk full) to clear messages.
-* **Export / Save As**: delimiter, quote policy (minimal/always), encoding,
-  line endings; scope = whole file, filtered rows or selection. Streaming,
-  bounded memory.
+* **Export** (File → Export / convert, Ctrl+E): delimiter, quote character,
+  quote policy (minimal/always), escape style, encoding with optional BOM,
+  line endings, header row; rows = all (inserted rows included, deleted
+  skipped), the rows in view (filter and/or sort order) or the selection
+  (optionally only its columns). Edits are applied. Records without quotes
+  or edits whose bytes need no quoting in the output take a fast path that
+  only swaps delimiters; everything else is decoded and re-encoded. A
+  filter list is read in file order. A dense sort permutation is written
+  without random reads: one sequential pass distributes the records into
+  rank-range buckets (temporary files next to the output, ~128 MB of source
+  each, or memory when one bucket suffices), then each bucket is ordered by
+  rank in memory and written; the `(offset, rank)` table costs 16 bytes per
+  row while it runs. The same temp-file/fsync/rename procedure as
+  Save makes exports atomic; exporting over a file open in Katak is
+  refused.
 
 ## 14. Memory budget (50 GB file, no edits)
 
