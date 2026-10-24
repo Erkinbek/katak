@@ -244,6 +244,44 @@ impl Target {
         self.overlay.as_ref().is_some_and(|o| o.is_deleted(offset))
     }
 
+    /// Fields of a record [`Target::value`] needs to see column `col`.
+    pub(crate) fn fields_for(&self, col: usize) -> usize {
+        match self.overlay.as_ref().and_then(|o| o.columns()) {
+            Some(_) => usize::MAX,
+            None => col + 1,
+        }
+    }
+
+    /// The value of logical column `col` of a record, with edits applied.
+    /// `spans` must hold the first [`Target::fields_for`] fields.
+    pub(crate) fn value<'a>(
+        &self,
+        offset: u64,
+        content: &'a [u8],
+        spans: &[FieldSpan],
+        col: usize,
+    ) -> Cow<'a, str> {
+        let raw = |i: usize| -> Cow<'a, str> {
+            match spans.get(i) {
+                Some(f) => match unquote(&self.dialect, &content[f.start..f.end], f.quoted) {
+                    Cow::Borrowed(b) => self.encoding.decode(b),
+                    Cow::Owned(v) => Cow::Owned(self.encoding.decode(&v).into_owned()),
+                },
+                None => Cow::Borrowed(""),
+            }
+        };
+        let ov = match &self.overlay {
+            Some(ov) if ov.row_edits(offset).is_some() || ov.columns().is_some() => ov,
+            _ => return raw(col),
+        };
+        let cref = ov.col_ref(col);
+        match (ov.cell(RowRef::Src(offset), cref), cref) {
+            (Some(e), _) => Cow::Owned(e.to_string()),
+            (None, ColRef::Src(i)) => raw(i as usize),
+            (None, ColRef::New(_)) => Cow::Borrowed(""),
+        }
+    }
+
     /// The values of a record in logical column order, with edits applied.
     /// `spans` must hold all fields of `content`.
     pub(crate) fn values<'a>(

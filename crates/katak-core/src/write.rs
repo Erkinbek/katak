@@ -29,6 +29,8 @@ pub struct Writer {
     comment: Option<String>,
     delim: Vec<u8>,
     eol: Vec<u8>,
+    /// Bytes that may make a value need quotes (a quick first pass).
+    special: [bool; 256],
     /// Characters that could not be represented in the encoding.
     pub unmappable: usize,
     /// A value needed quotes although the dialect has no quote character.
@@ -47,11 +49,33 @@ impl Writer {
         };
         let mut eol = Vec::new();
         d.encoding.encode(eol_text, &mut eol);
+        let quote = d.quote.unwrap_or('"');
+        let mut special = [false; 256];
+        let mut mark = |c: char| {
+            if c.is_ascii() {
+                special[c as usize] = true;
+            } else {
+                special[0x80..].iter_mut().for_each(|s| *s = true);
+            }
+        };
+        for c in [quote, '\r', '\n'] {
+            mark(c);
+        }
+        if let Some(c) = delim_text.chars().next() {
+            mark(c);
+        }
+        if d.escape == Escape::Backslash {
+            mark('\\');
+        }
+        if d.delimiter == Delimiter::Whitespace || d.trim {
+            mark(' ');
+            mark('\t');
+        }
         Writer {
             enc: d.encoding,
             delim_text,
             whitespace: d.delimiter == Delimiter::Whitespace,
-            quote: d.quote.unwrap_or('"'),
+            quote,
             quote_fallback: d.quote.is_none(),
             escape: d.escape,
             policy,
@@ -59,6 +83,7 @@ impl Writer {
             comment: d.comment_prefix.clone().filter(|c| !c.is_empty()),
             delim,
             eol,
+            special,
             unmappable: 0,
             used_fallback_quote: false,
         }
@@ -68,6 +93,14 @@ impl Writer {
     pub fn needs_quotes(&self, v: &str, first: bool) -> bool {
         if self.policy == QuotePolicy::Always {
             return true;
+        }
+        if (self.whitespace && v.is_empty())
+            || (first && self.comment.as_deref().is_some_and(|c| v.starts_with(c)))
+        {
+            return true;
+        }
+        if !v.bytes().any(|b| self.special[b as usize]) {
+            return false;
         }
         v.contains(self.delim_text.as_str())
             || v.contains(self.quote)

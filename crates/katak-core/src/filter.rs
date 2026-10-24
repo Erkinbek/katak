@@ -161,6 +161,25 @@ pub struct FilterData {
 /// Filter results shared between the job and the UI.
 pub type SharedFilter = Arc<Mutex<FilterData>>;
 
+impl FilterData {
+    /// A finished list of rows `[a, b)` of this one (e.g. a selection).
+    pub fn part(&self, a: usize, b: usize) -> SharedFilter {
+        let mut rows = ChunkedVec::new();
+        for i in a..b.min(self.rows.len()) {
+            if let Some(r) = self.rows.get(i) {
+                rows.push(r);
+            }
+        }
+        Arc::new(Mutex::new(FilterData {
+            matched: rows.len() as u64,
+            rows,
+            sorted: self.sorted,
+            done: true,
+            ..FilterData::default()
+        }))
+    }
+}
+
 /// A running (or finished) filter.
 pub struct FilterRun {
     pub job: Job,

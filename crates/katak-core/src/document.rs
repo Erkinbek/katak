@@ -689,6 +689,24 @@ impl Document {
             .set_cells(mapped, |r, c| originals.get(&(r, c)).cloned().flatten());
     }
 
+    /// Like [`Document::set_values`] for values known to differ from the
+    /// current ones (Replace All): only cells that already have an edit
+    /// need their source value read, so that restoring it drops the edit.
+    pub fn set_changed_values(&mut self, changes: Vec<(RowRef, usize, String)>) {
+        let mapped: Vec<(RowRef, ColRef, String)> = changes
+            .into_iter()
+            .map(|(r, c, v)| (r, self.overlay.col_ref(c), v))
+            .collect();
+        let mut originals = HashMap::new();
+        for (r, c, _) in &mapped {
+            if matches!(r, RowRef::Src(_)) && self.overlay.cell(*r, *c).is_some() {
+                originals.insert((*r, *c), self.original(*r, *c));
+            }
+        }
+        self.overlay
+            .set_cells(mapped, |r, c| originals.get(&(r, c)).cloned().flatten());
+    }
+
     /// Display name of logical column `col` (with renames), if the file has
     /// a header.
     pub fn column_name(&mut self, col: usize) -> Option<String> {

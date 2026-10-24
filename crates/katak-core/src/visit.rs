@@ -54,9 +54,21 @@ impl Prefilter {
 /// Reads the record starting at `offset` (its extent and its content,
 /// clipped to [`MAX_RECORD_BYTES`]).
 pub fn read_record(src: &Source, d: &Compiled, offset: u64) -> io::Result<(RecSpan, Vec<u8>)> {
+    let mut content = Vec::new();
+    let r = read_record_into(src, d, offset, &mut content)?;
+    Ok((r, content))
+}
+
+/// Like [`read_record`], appending the content to `out`.
+pub fn read_record_into(
+    src: &Source,
+    d: &Compiled,
+    offset: u64,
+    out: &mut Vec<u8>,
+) -> io::Result<RecSpan> {
     let mut reader = ChunkReader::cached(src, src.len(), 64 << 10);
     let mut sc = Scanner::new(d, offset);
-    let mut out = Vec::new();
+    let mut found = Vec::new();
     loop {
         let w = reader.window(sc.pos())?;
         let f = sc.feed(
@@ -64,24 +76,32 @@ pub fn read_record(src: &Source, d: &Compiled, offset: u64) -> io::Result<(RecSp
             w.base,
             w.eof,
             &mut Collect {
-                out: &mut out,
+                out: &mut found,
                 max: 1,
             },
         );
-        if !out.is_empty() || f == Feed::Done {
+        if !found.is_empty() || f == Feed::Done {
             break;
         }
     }
-    let r = out.pop().ok_or_else(|| {
+    let r = found.pop().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("no record at byte {offset}"),
         )
     })?;
     let len = ((r.content_end - r.start) as usize).min(MAX_RECORD_BYTES);
-    let mut content = vec![0u8; len];
-    src.read_at(r.start, &mut content)?;
-    Ok((r, content))
+    // Usually the record is inside the (mapped) window: no system call.
+    let w = reader.window(r.start)?;
+    let from = (r.start - w.base) as usize;
+    if from + len <= w.buf.len() {
+        out.extend_from_slice(&w.buf[from..from + len]);
+    } else {
+        let at = out.len();
+        out.resize(at + len, 0);
+        src.read_at(r.start, &mut out[at..])?;
+    }
+    Ok(r)
 }
 
 /// A record handed to the visitor callback.

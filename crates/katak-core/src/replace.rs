@@ -89,7 +89,7 @@ pub fn plan(
         d.edits = edits;
         d.over = over;
         match res {
-            Ok(_) => d.done = true,
+            Ok(o) => d.done = o.completed || over,
             Err(e) => {
                 d.error = Some(format!("reading the file failed: {e}"));
                 return Err(e.to_string());

@@ -28,6 +28,7 @@ use crate::visit::visit_records;
 use crate::write::{QuotePolicy, Writer};
 
 const COPY_CHUNK: usize = 8 << 20;
+const SMALL_COPY: u64 = 1 << 20;
 
 /// Everything needed to write a document.
 #[derive(Clone)]
@@ -96,6 +97,15 @@ fn cancelled() -> io::Error {
 impl<W: Write> Saver<'_, W> {
     /// Copies source bytes `[a, b)` verbatim.
     fn copy(&mut self, a: u64, b: u64) -> io::Result<()> {
+        // Short gaps (between rewritten records) come from the mapped
+        // views: one system call each would dominate.
+        if b > a && b - a <= SMALL_COPY && self.input.src.is_mapped() {
+            let bytes = self.input.src.bytes(a, (b - a) as usize)?;
+            self.out.put(&bytes)?;
+            self.ctl.set_done(b);
+            self.ctl.notify();
+            return Ok(());
+        }
         let mut pos = a;
         let mut chunk = vec![0u8; COPY_CHUNK.min((b.saturating_sub(a)) as usize)];
         while pos < b {
