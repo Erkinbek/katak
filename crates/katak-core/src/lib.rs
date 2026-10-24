@@ -15,6 +15,7 @@ pub mod job;
 pub mod locate;
 pub mod scan;
 pub mod source;
+pub mod sys;
 pub mod units;
 
 pub use dialect::{Compiled, Delimiter, Dialect, DialectError, Escape};
