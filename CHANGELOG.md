@@ -4,6 +4,53 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-10-24 — Milestone 3: editing and saving
+
+### Added
+
+- Edit overlay: cell edits keyed by record offset, inserted rows, deleted
+  record ranges, inserted/renamed/moved/deleted columns, and an undo/redo
+  stack of invertible operations. The source file is never copied.
+- Logical rows: inserted rows spliced in and deleted ranges skipped in
+  both directions, with consecutive logical row numbers.
+- In-place cell editor (double-click, F2, typing; Enter/Tab/arrows commit
+  and move; Esc cancels), an editable cell viewer for large or multi-line
+  values, edited-cell markers and green numbers for inserted rows.
+- Copy / cut / paste as Excel-compatible TSV, clear, fill down, select all,
+  insert/delete rows, insert/rename/move/delete columns, discard all edits,
+  read-only mode, with bounded operation sizes and a confirmation for
+  clipboard copies over 100 MB.
+- Streaming save: untouched bytes copied verbatim, only edited records
+  re-assembled (unchanged fields keep their raw bytes and quoting), temp
+  file + fsync + atomic rename, optional `.bak` (hard link), Save As,
+  clear error messages, progress and cancellation; unsaved-changes prompts
+  when closing a tab or quitting.
+- Search and filter see unsaved edits (deleted rows skipped, edited values
+  matched, edited records bypass the raw prefilter).
+- Checked-in fixtures in `testdata/fixtures` (marked `-text`) and an
+  end-to-end round-trip test over all of them; `katak-bench --save`.
+
+### Decisions
+
+- Inserted rows are anchored before a record offset (or at the end), so
+  "insert below" means "insert above the next row".
+- New values use minimal quoting; when the dialect has no quote character
+  and a value needs one, `"` is used and the user is told.
+- Characters the file's encoding cannot represent are written as `?` and
+  reported after saving.
+- The final rename uses `std::fs::rename` (POSIX semantics on Windows),
+  which replaces the file while Katak still has it open and mapped.
+- Changing parsing options drops unsaved edits (the dialog says so).
+- Search does not yet look into inserted rows.
+
+### Measured (Core Ultra 9 285, Windows 11, cached files)
+
+- Save without edits: byte-identical; 1 GB at 1.33 GB/s, 10 GB at
+  1.54 GB/s; peak private memory 25–29 MB.
+- Save with 5 edits, an inserted and a deleted row: 1 GB at 1.30 GB/s;
+  10 GB at 554 MB/s right after another 10 GB write (disk-bound).
+- UI frame times unchanged: 10 GB self-test with edits, max 5.6 ms.
+
 ## [0.2.0] — 2026-10-24 — Milestone 2: search and filter
 
 ### Added

@@ -19,7 +19,7 @@ The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 |-----------|-------|-------|
 | 1 | open, parsing dialog, virtualized grid, scrolling, go to row/offset | **done** (v0.1.0) |
 | 2 | search and filter | **done** (v0.2.0) |
-| 3 | edit overlay, undo/redo, save with byte-identical round trip | planned |
+| 3 | edit overlay, undo/redo, save with byte-identical round trip | **done** (v0.3.0) |
 | 4 | find/replace, sort, export conversions | planned |
 | 5 | encodings, raw-text mode, polish | planned |
 
@@ -68,6 +68,22 @@ The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   range per column, combined with AND. The grid shows the matching rows
   (with their original row numbers) while the filter is still running,
   with an "N of M rows match" counter; up to 4,000,000 rows are listed.
+* **Editing**: double-click, F2 or just start typing; Enter / Tab / arrows
+  commit and move, Esc cancels. Large or multi-line values open an editable
+  cell viewer. Copy / cut / paste as TSV (Excel-compatible; paste fills a
+  rectangle), Delete clears, Ctrl+D fills down. Insert rows above/below,
+  delete rows, insert / rename / move / delete columns. Undo/redo for
+  everything. Edited cells are marked and inserted rows numbered in green
+  until saved; "Discard all edits" and a read-only mode are in the Edit menu.
+* Edits are an **overlay** over the unchanged file: nothing is copied, and
+  search and filter see the unsaved values.
+* **Saving** (Ctrl+S) streams the file through the overlay into a temp file
+  next to it, fsyncs it and atomically replaces the original; untouched
+  rows are copied byte for byte (a save without edits is byte-identical),
+  edited rows keep their original delimiter, quoting of unchanged fields
+  and line ending. Optional `.bak` copy; Save As (Ctrl+Shift+S). A failed
+  or cancelled save never touches the original, and "file is open in
+  another program" / read-only / disk-full errors are explained.
 
 ## Building
 
@@ -117,6 +133,12 @@ Or start Katak and use File → Open, or drop files on the window.
 | Ctrl+F | Find |
 | F3 / Shift+F3 | Next / previous match |
 | Ctrl+Shift+L | Filter bar |
+| Ctrl+S / Ctrl+Shift+S | Save / Save as |
+| Ctrl+Z / Ctrl+Y | Undo / redo |
+| F2, double-click, typing | Edit the cell |
+| Enter / Tab / Esc (editing) | Commit and move down / right, cancel |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste (TSV) |
+| Delete / Ctrl+D / Ctrl+A | Clear / fill down / select all |
 | Ctrl+G | Go to row |
 | Ctrl+Shift+G | Go to byte offset |
 | F8 | Next ragged row |
@@ -126,7 +148,7 @@ Or start Katak and use File → Open, or drop files on the window.
 | Ctrl+Home / Ctrl+End | First / last row |
 | Shift+mouse wheel | Scroll horizontally |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
-| Double-click a cell | Open the whole cell |
+| Right-click a cell | Rows, columns, clipboard, filter |
 | Right-click a column header | Filter this column, auto-fit, freeze, column type |
 | F1 | Shortcut list |
 
@@ -158,12 +180,15 @@ files in the OS cache, release build. Files come from `tools/katak-gen`.
 | Filter (literal / numeric range), 1 GB | ≥ 500 MB/s | **1.17–1.28 GB/s / 810 MB/s** |
 | Filter (literal / numeric range), 10 GB | ≥ 500 MB/s | **1.17–1.23 GB/s / 771 MB/s** |
 | UI frame time with highlighting / filtered view | < 16 ms | **max 4.6 ms / 9.0 ms** |
+| Save, zero edits (10 GB) | byte-identical | **identical, 1.54 GB/s** |
+| Save with a handful of edits (10 GB): private memory | < 300 MB | **29 MB peak** |
+| Save with a handful of edits (10 GB): throughput | disk-bound | **554 MB/s** (the disk was flushing the previous 10 GB write; 1.3 GB/s for 1 GB) |
 
 Reproduce with:
 
 ```sh
 cargo run --release -p katak-gen                       # writes testdata/generated/ (~12 GB)
-cargo run --release -p katak-bench -- testdata/generated/big_10g.csv --suite
+cargo run --release -p katak-bench -- testdata/generated/big_10g.csv --suite --save
 target/release/katak testdata/generated/big_10g.csv --perf perf.log --self-test
 ```
 
