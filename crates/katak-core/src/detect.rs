@@ -18,6 +18,7 @@ pub const SAMPLE_BYTES: usize = 1 << 20;
 const SCORE_RECORDS: usize = 1000;
 const SCORE_BYTES: usize = 256 << 10;
 const CLEAN_RECORDS: usize = 200;
+const CLEAN_CELLS: usize = 4000;
 
 /// What was detected, with human-readable notes for the parsing dialog.
 #[derive(Clone, Debug)]
@@ -248,9 +249,13 @@ fn score(d: &Dialect, text: &[u8]) -> f64 {
         _ => None,
     };
     let (mut clean, mut total) = (0usize, 0usize);
-    for r in recs.iter().take(CLEAN_RECORDS) {
+    'records: for r in recs.iter().take(CLEAN_RECORDS) {
         let content = &text[r.start as usize..r.content_end as usize];
         for f in split_all(&c, content) {
+            // Enough evidence; very wide files would otherwise cost ms here.
+            if total >= CLEAN_CELLS {
+                break 'records;
+            }
             let v = String::from_utf8_lossy(&unquote(&c, &content[f.start..f.end], f.quoted))
                 .into_owned();
             total += 1;

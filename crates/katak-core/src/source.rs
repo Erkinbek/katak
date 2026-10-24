@@ -1,19 +1,26 @@
-//! File access: a memory map where that is safe, buffered positional reads
-//! otherwise.
+//! File access: memory-mapped views where that is safe, buffered
+//! positional reads otherwise.
 //!
 //! On Windows a page fault on a mapping whose backing store disappears
 //! (network share dropped, USB stick pulled) is an access violation, while a
 //! failed `read` is an error we can report. Network and removable drives are
 //! therefore read through a small block cache instead of being mapped.
+//!
+//! The file is never mapped as a whole: Windows charges the page-table
+//! entries of a mapped view to the process (about 2 MB per GB), so a single
+//! 50 GB view costs 100 MB of private memory before a byte is read. Random
+//! access maps 16 MB views on demand and keeps a few of them; bulk scans
+//! read with `pread`/`ReadFile` into a reusable buffer, which is also faster
+//! than faulting pages in.
 
-use std::borrow::Cow;
 use std::fs::File;
 use std::io;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use parking_lot::Mutex;
 
 /// How to access the file.
@@ -30,6 +37,73 @@ pub enum AccessMode {
 
 const BLOCK: usize = 1 << 20;
 const CACHE_BLOCKS: usize = 32;
+/// Size of a cached mapped view. Views overlap by `VIEW_OVERLAP`, so any
+/// request of up to that many bytes fits in one view.
+const VIEW: u64 = 16 << 20;
+const VIEW_OVERLAP: u64 = 8 << 20;
+const CACHE_VIEWS: usize = 16;
+
+/// Bytes borrowed from a mapped view (kept alive by the handle) or owned.
+pub enum Bytes {
+    Mapped(Arc<Mmap>, Range<usize>),
+    Owned(Vec<u8>),
+}
+
+impl Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Bytes::Mapped(m, r) => &m[r.clone()],
+            Bytes::Owned(v) => v,
+        }
+    }
+}
+
+impl std::fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bytes({} bytes)", self.len())
+    }
+}
+
+/// A tiny least-recently-used cache keyed by block/view number.
+struct Lru<T> {
+    items: Vec<(u64, T, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl<T: Clone> Lru<T> {
+    fn new(cap: usize) -> Self {
+        Lru {
+            items: Vec::new(),
+            tick: 0,
+            cap,
+        }
+    }
+
+    fn get(&mut self, key: u64) -> Option<T> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.items.iter_mut().find(|e| e.0 == key).map(|e| {
+            e.2 = tick;
+            e.1.clone()
+        })
+    }
+
+    fn put(&mut self, key: u64, value: T) {
+        if self.items.len() >= self.cap
+            && let Some(oldest) = self
+                .items
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.2)
+                .map(|(i, _)| i)
+        {
+            self.items.swap_remove(oldest);
+        }
+        self.items.push((key, value, self.tick));
+    }
+}
 
 /// An open, immutable view of a file's bytes as they were at open time.
 pub struct Source {
@@ -37,15 +111,10 @@ pub struct Source {
     len: u64,
     modified: Option<SystemTime>,
     file: File,
-    map: Option<Mmap>,
+    mappable: bool,
     buffered_reason: Option<String>,
-    cache: Mutex<BlockCache>,
-}
-
-#[derive(Default)]
-struct BlockCache {
-    blocks: Vec<(u64, Arc<[u8]>, u64)>,
-    tick: u64,
+    blocks: Mutex<Lru<Arc<[u8]>>>,
+    views: Mutex<Lru<Arc<Mmap>>>,
 }
 
 impl std::fmt::Debug for Source {
@@ -53,7 +122,7 @@ impl std::fmt::Debug for Source {
         f.debug_struct("Source")
             .field("path", &self.path)
             .field("len", &self.len)
-            .field("mapped", &self.map.is_some())
+            .field("mapped", &self.mappable)
             .finish()
     }
 }
@@ -71,23 +140,21 @@ impl Source {
         }
         let len = meta.len();
         let mut buffered_reason = None;
-        let map = if len == 0 {
-            None
+        let mappable = if len == 0 {
+            false
         } else if mode == AccessMode::Buffered {
             buffered_reason = Some("buffered access requested".to_string());
-            None
+            false
         } else if mode == AccessMode::Auto && !mapping_is_safe(path) {
             buffered_reason = Some("network or removable drive".to_string());
-            None
+            false
         } else {
-            // SAFETY: the map is read-only. Another process may still change
-            // the file underneath us; on Windows it cannot truncate a mapped
-            // file, and appended bytes beyond `len` are never looked at.
-            match unsafe { Mmap::map(&file) } {
-                Ok(map) => Some(map),
+            // Probe once so a file system that cannot map falls back cleanly.
+            match map_range(&file, 0, len.min(4096)) {
+                Ok(_) => true,
                 Err(e) => {
                     buffered_reason = Some(format!("memory mapping failed: {e}"));
-                    None
+                    false
                 }
             }
         };
@@ -96,9 +163,10 @@ impl Source {
             len,
             modified: meta.modified().ok(),
             file,
-            map,
+            mappable,
             buffered_reason,
-            cache: Mutex::new(BlockCache::default()),
+            blocks: Mutex::new(Lru::new(CACHE_BLOCKS)),
+            views: Mutex::new(Lru::new(CACHE_VIEWS)),
         })
     }
 
@@ -120,8 +188,9 @@ impl Source {
         self.modified
     }
 
+    /// Random access goes through memory-mapped views.
     pub fn is_mapped(&self) -> bool {
-        self.map.is_some()
+        self.mappable
     }
 
     /// Why the file is read in chunks instead of mapped.
@@ -129,22 +198,13 @@ impl Source {
         self.buffered_reason.as_deref()
     }
 
-    /// The whole file, if it is memory-mapped.
-    pub fn mapped(&self) -> Option<&[u8]> {
-        self.map.as_deref()
-    }
-
     /// Reads into `buf` from `off` until `buf` is full or the file ends.
-    /// Returns the number of bytes read. Bypasses the block cache.
+    /// Returns the number of bytes read. Bypasses caches and views.
     pub fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         if off >= self.len {
             return Ok(0);
         }
         let n = buf.len().min((self.len - off) as usize);
-        if let Some(map) = &self.map {
-            buf[..n].copy_from_slice(&map[off as usize..off as usize + n]);
-            return Ok(n);
-        }
         let got = read_full_at(&self.file, &mut buf[..n], off)?;
         if got < n {
             return Err(io::Error::new(
@@ -155,13 +215,17 @@ impl Source {
         Ok(got)
     }
 
-    /// Bytes `[off, off + len)`, clipped to the end of the file. Borrowed from
-    /// the map, or assembled from cached blocks.
-    pub fn bytes(&self, off: u64, len: usize) -> io::Result<Cow<'_, [u8]>> {
+    /// Bytes `[off, off + len)`, clipped to the end of the file: borrowed
+    /// from a mapped view, or assembled from cached blocks.
+    pub fn bytes(&self, off: u64, len: usize) -> io::Result<Bytes> {
         let off = off.min(self.len);
         let end = off.saturating_add(len as u64).min(self.len);
-        if let Some(map) = &self.map {
-            return Ok(Cow::Borrowed(&map[off as usize..end as usize]));
+        if self.mappable && end > off {
+            // A failed mapping (address space, odd file systems) falls back
+            // to plain reads.
+            if let Ok(b) = self.view_bytes(off, end) {
+                return Ok(b);
+            }
         }
         let mut out = Vec::with_capacity((end - off) as usize);
         let mut pos = off;
@@ -176,39 +240,53 @@ impl Source {
             out.extend_from_slice(&block[in_block..in_block + take]);
             pos += take as u64;
         }
-        Ok(Cow::Owned(out))
+        Ok(Bytes::Owned(out))
+    }
+
+    fn view_bytes(&self, off: u64, end: u64) -> io::Result<Bytes> {
+        let k = off / VIEW;
+        let vstart = k * VIEW;
+        let vend = (vstart + VIEW + VIEW_OVERLAP).min(self.len);
+        if end <= vend {
+            let cached = self.views.lock().get(k);
+            let view = match cached {
+                Some(v) => v,
+                None => {
+                    let v = Arc::new(map_range(&self.file, vstart, vend - vstart)?);
+                    self.views.lock().put(k, v.clone());
+                    v
+                }
+            };
+            return Ok(Bytes::Mapped(
+                view,
+                (off - vstart) as usize..(end - vstart) as usize,
+            ));
+        }
+        // Larger than the overlap: map exactly this range, uncached.
+        let v = Arc::new(map_range(&self.file, off, end - off)?);
+        Ok(Bytes::Mapped(v, 0..(end - off) as usize))
     }
 
     fn block(&self, bi: u64) -> io::Result<Arc<[u8]>> {
-        {
-            let mut c = self.cache.lock();
-            c.tick += 1;
-            let tick = c.tick;
-            if let Some(e) = c.blocks.iter_mut().find(|e| e.0 == bi) {
-                e.2 = tick;
-                return Ok(e.1.clone());
-            }
+        if let Some(b) = self.blocks.lock().get(bi) {
+            return Ok(b);
         }
         let start = bi * BLOCK as u64;
         let n = (BLOCK as u64).min(self.len - start) as usize;
         let mut data = vec![0u8; n];
         self.read_at(start, &mut data)?;
         let data: Arc<[u8]> = data.into();
-        let mut c = self.cache.lock();
-        let tick = c.tick;
-        if c.blocks.len() >= CACHE_BLOCKS
-            && let Some(oldest) = c
-                .blocks
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.2)
-                .map(|(i, _)| i)
-        {
-            c.blocks.swap_remove(oldest);
-        }
-        c.blocks.push((bi, data.clone(), tick));
+        self.blocks.lock().put(bi, data.clone());
         Ok(data)
     }
+}
+
+/// Maps `[off, off + len)` read-only.
+fn map_range(file: &File, off: u64, len: u64) -> io::Result<Mmap> {
+    // SAFETY: the map is read-only. Another process may still change the
+    // file underneath us; on Windows it cannot truncate a file with mapped
+    // views, and bytes appended beyond the open-time length are never read.
+    unsafe { MmapOptions::new().offset(off).len(len as usize).map(file) }
 }
 
 fn read_full_at(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
@@ -279,15 +357,21 @@ impl Window<'_> {
 
 /// Sequential reader in `fill`/`consume` style: each call returns a window
 /// starting a little before `at` (history) and extending at least `chunk`
-/// bytes past it (unless the end is reached). Zero-copy over a map; buffered
-/// sources keep the unconsumed tail and refill a reusable buffer.
+/// bytes past it (unless the end is reached). Bulk readers keep the
+/// unconsumed tail and refill a reusable buffer with positional reads;
+/// cached readers (small UI-side reads) borrow mapped views or use the
+/// block cache.
 pub struct ChunkReader<'a> {
     src: &'a Source,
     end: u64,
     chunk: usize,
+    /// Reused buffer; only `buf[..valid]` is meaningful (it is never shrunk
+    /// or re-zeroed, which would cost a 16 MB memset per refill).
     buf: Vec<u8>,
+    valid: usize,
     buf_base: u64,
     cached: bool,
+    held: Option<Bytes>,
 }
 
 impl<'a> ChunkReader<'a> {
@@ -301,13 +385,15 @@ impl<'a> ChunkReader<'a> {
             end: end.min(src.len()),
             chunk: chunk.max(64),
             buf: Vec::new(),
+            valid: 0,
             buf_base: 0,
             cached: false,
+            held: None,
         }
     }
 
-    /// Like [`ChunkReader::new`], but buffered sources read through the
-    /// shared block cache (for small, repeated UI-side reads).
+    /// Like [`ChunkReader::new`], but reading through the source's mapped
+    /// views or block cache (for small, repeated UI-side reads).
     pub fn cached(src: &'a Source, end: u64, chunk: usize) -> Self {
         ChunkReader {
             cached: true,
@@ -324,37 +410,43 @@ impl<'a> ChunkReader<'a> {
         let at = at.min(self.end);
         let lo = at.saturating_sub(Self::HISTORY as u64);
         let hi = at.saturating_add(self.chunk as u64).min(self.end);
-        if let Some(map) = self.src.mapped() {
+        if self.cached && self.src.is_mapped() {
+            let held = self.held.insert(self.src.bytes(lo, (hi - lo) as usize)?);
             return Ok(Window {
-                buf: &map[lo as usize..hi as usize],
+                buf: held,
                 base: lo,
                 eof: hi == self.end,
             });
         }
-        let have_hi = self.buf_base + self.buf.len() as u64;
+        let have_hi = self.buf_base + self.valid as u64;
         let enough = lo >= self.buf_base && at <= have_hi && (have_hi >= hi || have_hi == self.end);
         if !enough {
             if lo >= self.buf_base && lo <= have_hi {
-                self.buf.drain(..(lo - self.buf_base) as usize);
+                let keep_from = (lo - self.buf_base) as usize;
+                self.buf.copy_within(keep_from..self.valid, 0);
+                self.valid -= keep_from;
             } else {
-                self.buf.clear();
+                self.valid = 0;
             }
             self.buf_base = lo;
-            let have = self.buf_base + self.buf.len() as u64;
+            let have = self.buf_base + self.valid as u64;
             let want = (hi - have) as usize;
+            let need = self.valid + want;
+            if self.buf.len() < need {
+                self.buf.resize(need, 0);
+            }
             if self.cached {
                 let bytes = self.src.bytes(have, want)?;
-                self.buf.extend_from_slice(&bytes);
+                self.buf[self.valid..self.valid + bytes.len()].copy_from_slice(&bytes);
+                self.valid += bytes.len();
             } else {
-                let old = self.buf.len();
-                self.buf.resize(old + want, 0);
-                let got = self.src.read_at(have, &mut self.buf[old..])?;
-                self.buf.truncate(old + got);
+                let got = self.src.read_at(have, &mut self.buf[self.valid..need])?;
+                self.valid += got;
             }
         }
-        let buf_end = self.buf_base + self.buf.len() as u64;
+        let buf_end = self.buf_base + self.valid as u64;
         Ok(Window {
-            buf: &self.buf[(lo - self.buf_base) as usize..],
+            buf: &self.buf[(lo - self.buf_base) as usize..self.valid],
             base: lo,
             eof: buf_end == self.end,
         })
@@ -380,8 +472,31 @@ mod tests {
         let b = Source::open(&p, AccessMode::Buffered).unwrap();
         assert!(m.is_mapped());
         assert!(!b.is_mapped());
-        for (off, len) in [(0, 10), (1_048_570, 20), (2_999_990, 100), (5_000_000, 5)] {
-            assert_eq!(m.bytes(off, len).unwrap(), b.bytes(off, len).unwrap());
+        for (off, len) in [
+            (0, 10),
+            (1_048_570, 20),
+            (2_999_990, 100),
+            (5_000_000, 5),
+            (10, 2_999_000),
+        ] {
+            assert_eq!(&*m.bytes(off, len).unwrap(), &*b.bytes(off, len).unwrap());
+        }
+    }
+
+    #[test]
+    fn views_cover_requests_across_view_boundaries() {
+        // Requests straddling the 64 MB view grid, larger than the overlap.
+        let len = (VIEW + VIEW_OVERLAP + (3 << 20)) as usize;
+        let data: Vec<u8> = (0..len).map(|i| (i % 249) as u8).collect();
+        let (_d, p) = temp_with(&data);
+        let m = Source::open(&p, AccessMode::Mapped).unwrap();
+        for (off, n) in [
+            (VIEW - 10, 20usize),
+            (VIEW + VIEW_OVERLAP - 5, 10),
+            (VIEW - (1 << 20), (20 << 20) as usize),
+        ] {
+            let got = m.bytes(off, n).unwrap();
+            assert_eq!(&*got, &data[off as usize..(off as usize + n).min(len)]);
         }
     }
 
@@ -391,22 +506,28 @@ mod tests {
         let (_d, p) = temp_with(&data);
         for mode in [AccessMode::Mapped, AccessMode::Buffered] {
             let src = Source::open(&p, mode).unwrap();
-            let mut rd = ChunkReader::new(&src, src.len(), 10_000);
-            let mut at = 0u64;
-            let mut seen = 0u64;
-            loop {
-                let w = rd.window(at).unwrap();
-                assert!(w.base <= at && at <= w.end());
-                assert_eq!(w.buf, &data[w.base as usize..w.end() as usize]);
-                assert!(at - w.base <= ChunkReader::HISTORY as u64);
-                if w.eof && at == w.end() {
-                    break;
+            for cached in [false, true] {
+                let mut rd = if cached {
+                    ChunkReader::cached(&src, src.len(), 10_000)
+                } else {
+                    ChunkReader::new(&src, src.len(), 10_000)
+                };
+                let mut at = 0u64;
+                let mut seen = 0u64;
+                loop {
+                    let w = rd.window(at).unwrap();
+                    assert!(w.base <= at && at <= w.end());
+                    assert_eq!(w.buf, &data[w.base as usize..w.end() as usize]);
+                    assert!(at - w.base <= ChunkReader::HISTORY as u64);
+                    if w.eof && at == w.end() {
+                        break;
+                    }
+                    // Consume a ragged amount.
+                    at = (at + 7_777).min(w.end());
+                    seen += 1;
                 }
-                // Consume a ragged amount.
-                at = (at + 7_777).min(w.end());
-                seen += 1;
+                assert!(seen > 20);
             }
-            assert!(seen > 20);
         }
     }
 
