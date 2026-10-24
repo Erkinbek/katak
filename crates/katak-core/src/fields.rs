@@ -383,8 +383,9 @@ pub fn clip(raw: &[u8], enc: TextEncoding, max: usize) -> (&[u8], bool) {
     (&raw[..n], true)
 }
 
-/// Makes control characters visible for single-line display: LF/CR become
-/// `↵`, TAB becomes `→`, other C0 controls become their Control Pictures.
+/// Makes control characters visible for single-line display: a line break
+/// (LF, CR or CRLF) becomes `¶`, TAB becomes `→`, other controls use caret
+/// notation (`^@` for NUL). Only glyphs present in the default UI font.
 pub fn visible(s: &str) -> Cow<'_, str> {
     if !s.bytes().any(|b| b < 0x20 || b == 0x7F) {
         return Cow::Borrowed(s);
@@ -394,10 +395,13 @@ pub fn visible(s: &str) -> Cow<'_, str> {
     for c in s.chars() {
         match c {
             '\n' if prev_cr => {}
-            '\n' | '\r' => out.push('↵'),
+            '\n' | '\r' => out.push('¶'),
             '\t' => out.push('→'),
-            '\u{7F}' => out.push('␡'),
-            c if (c as u32) < 0x20 => out.push(char::from_u32(0x2400 + c as u32).unwrap_or('?')),
+            '\u{7F}' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push((b'@' + c as u8) as char);
+            }
             c => out.push(c),
         }
         prev_cr = c == '\r';
@@ -574,7 +578,7 @@ mod tests {
 
     #[test]
     fn visible_controls() {
-        assert_eq!(visible("a\r\nb\tc\0"), "a↵b→c␀");
+        assert_eq!(visible("a\r\nb\tc\0"), "a¶b→c^@");
         assert!(matches!(visible("plain"), Cow::Borrowed(_)));
     }
 }

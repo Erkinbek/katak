@@ -27,6 +27,9 @@ use crate::with_units;
 pub const ROW_PARSE_BUDGET: usize = 8 << 20;
 const FIELD_STRIDE: usize = 64;
 const FIELD_CACHE: usize = 512;
+/// Fields split per frame while building the field index of wide records,
+/// so even a record with a million fields never costs one long frame.
+const FIELD_BUDGET: usize = 256 * 1024;
 const SKIP_LINES_LIMIT: u64 = 64 << 20;
 
 /// How to open a file.
@@ -74,6 +77,8 @@ pub struct DocStats {
 struct FieldIndex {
     /// Start of field `k * FIELD_STRIDE`, relative to the record start.
     starts: Vec<usize>,
+    /// Every field of the (parsed part of the) record is covered.
+    complete: bool,
 }
 
 /// An open file.
@@ -88,7 +93,9 @@ pub struct Document {
     index_job: Option<Job>,
     locator: Locator,
     notify: Notify,
-    field_cache: HashMap<u64, (Arc<FieldIndex>, u64)>,
+    field_cache: HashMap<u64, (FieldIndex, u64)>,
+    field_budget: usize,
+    fields_pending: bool,
     tick: u64,
     generation: u64,
     opened: Instant,
@@ -130,6 +137,8 @@ impl Document {
             index_job: None,
             notify,
             field_cache: HashMap::new(),
+            field_budget: FIELD_BUDGET,
+            fields_pending: false,
             tick: 0,
             generation: 0,
             opened: Instant::now(),
@@ -317,9 +326,19 @@ impl Document {
         let source = self.source.clone();
         let bytes = source.bytes(rec.start, parse_len)?;
         let (from, first) = if cols.start >= FIELD_STRIDE && parse_len > 4096 {
-            let fi = self.field_index(rec.start, &bytes);
-            let k = (cols.start / FIELD_STRIDE).min(fi.starts.len().saturating_sub(1));
-            (fi.starts.get(k).copied().unwrap_or(0), k * FIELD_STRIDE)
+            let want = cols.start / FIELD_STRIDE;
+            let (k, start, complete) = self.stride_start(rec.start, &bytes, want);
+            if k < want && !complete {
+                // Not reached within this frame's budget: show placeholders.
+                self.fields_pending = true;
+                return Ok(cols
+                    .map(|_| Cell {
+                        unknown: true,
+                        ..Cell::default()
+                    })
+                    .collect());
+            }
+            (start, k * FIELD_STRIDE)
         } else {
             (0, 0)
         };
@@ -378,33 +397,57 @@ impl Document {
         }))
     }
 
-    fn field_index(&mut self, rec_start: u64, bytes: &[u8]) -> Arc<FieldIndex> {
+    /// Start of field `k * FIELD_STRIDE` of a record, extending the record's
+    /// field index within this frame's budget. Returns the stride actually
+    /// reached, its start offset and whether the index is complete.
+    fn stride_start(&mut self, rec_start: u64, bytes: &[u8], k: usize) -> (usize, usize, bool) {
         self.tick += 1;
-        if let Some(e) = self.field_cache.get_mut(&rec_start) {
-            e.1 = self.tick;
-            return e.0.clone();
-        }
-        let mut starts = vec![0usize];
-        let mut spans = Vec::new();
-        let mut from = 0;
-        loop {
-            spans.clear();
-            match split(&self.compiled, bytes, from, FIELD_STRIDE, &mut spans) {
-                Some(next) => {
-                    starts.push(next);
-                    from = next;
-                }
-                None => break,
+        if !self.field_cache.contains_key(&rec_start) {
+            if self.field_cache.len() >= FIELD_CACHE
+                && let Some(&old) = self.field_cache.iter().min_by_key(|e| (e.1).1).map(|e| e.0)
+            {
+                self.field_cache.remove(&old);
             }
+            self.field_cache.insert(
+                rec_start,
+                (
+                    FieldIndex {
+                        starts: vec![0],
+                        complete: false,
+                    },
+                    0,
+                ),
+            );
         }
-        let fi = Arc::new(FieldIndex { starts });
-        if self.field_cache.len() >= FIELD_CACHE
-            && let Some(&old) = self.field_cache.iter().min_by_key(|e| (e.1).1).map(|e| e.0)
-        {
-            self.field_cache.remove(&old);
+        let compiled = self.compiled.clone();
+        let Some((fi, used)) = self.field_cache.get_mut(&rec_start) else {
+            return (0, 0, false);
+        };
+        *used = self.tick;
+        let mut spans = Vec::new();
+        while fi.starts.len() <= k && !fi.complete && self.field_budget > 0 {
+            spans.clear();
+            let from = fi.starts[fi.starts.len() - 1];
+            match split(&compiled, bytes, from, FIELD_STRIDE, &mut spans) {
+                Some(next) => fi.starts.push(next),
+                None => fi.complete = true,
+            }
+            self.field_budget = self.field_budget.saturating_sub(FIELD_STRIDE);
         }
-        self.field_cache.insert(rec_start, (fi.clone(), self.tick));
-        fi
+        let reached = k.min(fi.starts.len() - 1);
+        (reached, fi.starts[reached], fi.complete)
+    }
+
+    /// Starts a UI frame: resets the per-frame parsing budget.
+    pub fn begin_frame(&mut self) {
+        self.field_budget = FIELD_BUDGET;
+        self.fields_pending = false;
+    }
+
+    /// Some cells were left as placeholders this frame (budget exhausted);
+    /// the caller should repaint soon.
+    pub fn cells_pending(&self) -> bool {
+        self.fields_pending
     }
 
     /// Decoded cells of the first records in the sample (for column widths,
