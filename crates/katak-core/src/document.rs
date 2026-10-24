@@ -10,6 +10,7 @@ use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::detect::{self, Detection, SAMPLE_BYTES};
@@ -84,6 +85,13 @@ struct FieldIndex {
     complete: bool,
 }
 
+/// Generations are unique across documents, so state tied to one (a
+/// filter, a sort) is never mistaken for another's after Save As.
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// An open file.
 pub struct Document {
     source: Arc<Source>,
@@ -146,7 +154,7 @@ impl Document {
             field_budget: FIELD_BUDGET,
             fields_pending: false,
             tick: 0,
-            generation: 0,
+            generation: next_generation(),
             opened: Instant::now(),
             sample_avg: None,
             access: opts.access,
@@ -164,7 +172,7 @@ impl Document {
         self.data_start = data_start_for(&self.source, &self.sample, &dialect)?;
         self.dialect = dialect;
         self.compiled = compiled;
-        self.generation += 1;
+        self.generation = next_generation();
         self.restart_index();
         Ok(())
     }
@@ -498,7 +506,7 @@ impl Document {
         self.source = source;
         self.sample = sample.into();
         self.overlay.clear();
-        self.generation += 1;
+        self.generation = next_generation();
         self.restart_index();
         Ok(())
     }
