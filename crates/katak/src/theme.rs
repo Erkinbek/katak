@@ -76,35 +76,18 @@ pub fn cell_font(size: f32, monospace: bool) -> FontId {
     )
 }
 
-/// A small procedurally drawn icon: a teal tile with a white table grid.
+/// The window icon: the logo (docs/images/logo.svg, a grid with one
+/// highlighted cell), the same picture as the .exe icon on Windows.
 pub fn app_icon() -> IconData {
-    const N: usize = 32;
-    let mut rgba = vec![0u8; N * N * 4];
-    for y in 0..N {
-        for x in 0..N {
-            let i = (y * N + x) * 4;
-            // Rounded corners.
-            let (cx, cy) = (x.min(N - 1 - x), y.min(N - 1 - y));
-            if cx < 3 && cy < 3 && (3 - cx) * (3 - cx) + (3 - cy) * (3 - cy) > 9 {
-                continue;
-            }
-            let line = (x > 4 && x < N - 5)
-                && (y > 4 && y < N - 5)
-                && (x == 5 || x == 13 || x == N - 6 || y == 5 || y == 11 || y == 18 || y == N - 6);
-            let header = (x > 4 && x < N - 5) && (y > 5 && y < 11);
-            let (r, g, b) = if line {
-                (255, 255, 255)
-            } else if header {
-                (0xB8, 0xF0, 0xE6)
-            } else {
-                (0x0F, 0x8B, 0x7A)
-            };
-            rgba[i..i + 4].copy_from_slice(&[r, g, b, 255]);
-        }
-    }
-    IconData {
-        rgba,
-        width: N as u32,
-        height: N as u32,
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_icon_decodes() {
+        let icon = super::app_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 }
