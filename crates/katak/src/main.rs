@@ -11,7 +11,8 @@
 //! once the first file is shown (optionally with a dialog open or an
 //! action run: `parse`, `parse-raw`, `goto`, `shortcuts`, `edit`, `export`, `exportto=PATH`, `selectall`,
 //! `search=TEXT`, `filter=COL:TEXT`, `replace=FIND:WITH`, `replaceall=FIND:WITH`,
-//! `sort=COL:asc|desc`) and exits.
+//! `sort=COL:asc|desc`) and exits. It is taken 800 ms after the first
+//! paint; `KATAK_SHOT_DELAY_MS` waits longer (e.g. for a sort to finish).
 
 // No console window for release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

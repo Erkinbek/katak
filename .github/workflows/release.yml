@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Builds every package without publishing (Actions -> Release -> Run
+  # workflow), to test the packaging before tagging.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,23 +23,19 @@ jobs:
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            exe: katak.exe
           - name: linux-x64
             # The oldest supported runner keeps the glibc requirement low.
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            exe: katak
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            exe: katak
           - name: macos-x64
             os: macos-latest
             target: x86_64-apple-darwin
-            exe: katak
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,41 +54,95 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p katak --target ${{ matrix.target }}
 
+      # The version comes from Cargo.toml; a tag must match it.
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo pkgid -p katak | sed -E 's/.*[#@]//')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
+            exit 1
+          fi
+
+      # Asset names carry no version, so .../releases/latest/download/<name>
+      # (linked from the README and the website) always gets the newest build.
+      # Archives keep the executable bit on Linux and macOS.
       - name: Package binary
         shell: bash
         run: |
           mkdir -p dist
-          ext=""
-          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
-          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "dist/katak-${{ github.ref_name }}-${{ matrix.name }}${ext}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/katak.exe" "dist/katak-${{ matrix.name }}.exe"
+          else
+            bin="target/${{ matrix.target }}/release/katak"
+            # The line tables kept for backtraces make the Linux executable
+            # ~78 MB (macOS keeps them outside the executable). Function
+            # names stay.
+            if [ "${{ runner.os }}" = "Linux" ]; then strip --strip-debug "$bin"; fi
+            mkdir -p "pkg/katak"
+            cp "$bin" README.md LICENSE pkg/katak/
+            tar -C pkg -czf "dist/katak-${{ matrix.name }}.tar.gz" katak
+          fi
 
-      - name: Build Windows installer
+      - name: Build Windows installers
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          # WiX 5 targets .NET 6; let it run on a newer runtime.
+          DOTNET_ROLL_FORWARD: Major
         run: |
-          choco install innosetup --no-progress -y
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceExe=$PWD\target\${{ matrix.target }}\release\katak.exe" "/O$PWD\dist" "/Fkatak-${{ github.ref_name }}-windows-x64-setup" packaging\windows\katak.iss
+          $exe = "$PWD\target\${{ matrix.target }}\release\katak.exe"
+          $dist = "$PWD\dist"
 
-      - uses: actions/upload-artifact@v4
+          # Inno Setup: the installer for most people (per-user or all users,
+          # "Open with" for .csv/.tsv/.txt).
+          choco install innosetup --no-progress -y
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc.FullName "/DAppVersion=$env:VERSION" "/DSourceExe=$exe" "/O$dist" "/Fkatak-${{ matrix.name }}-setup" packaging\windows\katak.iss
+          if ($LASTEXITCODE) { throw "ISCC failed" }
+
+          # MSI for deployment with Group Policy, Intune and similar tools.
+          dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP\wix"
+          $wix = "$env:RUNNER_TEMP\wix\wix.exe"
+          Push-Location packaging\windows
+          & $wix extension add WixToolset.UI.wixext/5.0.2
+          & $wix build katak.wxs -arch x64 -ext WixToolset.UI.wixext -d "Version=$env:VERSION" -d "SourceExe=$exe" -o "$dist\katak-${{ matrix.name }}.msi"
+          if ($LASTEXITCODE) { throw "wix build failed" }
+          Pop-Location
+          Remove-Item "$dist\*.wixpdb"
+          Get-ChildItem $dist
+
+      - uses: actions/upload-artifact@v7
         with:
           name: katak-${{ matrix.name }}
           path: dist/*
 
   release:
+    # Manual runs only build; tags publish.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The checkout has the tag as a plain ref; fetch the annotated tag
+          # object, whose message becomes the release notes.
+          git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           notes=$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")
           gh release create "${GITHUB_REF_NAME}" dist/* --title "Katak ${GITHUB_REF_NAME}" --notes "${notes:-Katak ${GITHUB_REF_NAME}}"

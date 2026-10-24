@@ -1,0 +1,71 @@
+<!--
+  WiX Toolset 5 source of the Katak MSI, for administrators who deploy
+  software with Group Policy, Intune or other MSI-based tools. Everyone else
+  can use the portable katak.exe or the Inno Setup installer (katak.iss).
+
+  Build (in this directory, WiX 5: dotnet tool install -g wix -v 5.0.2):
+    wix extension add WixToolset.UI.wixext/5.0.2
+    wix build katak.wxs -arch x64 -ext WixToolset.UI.wixext
+        -d Version=0.5.1 -d SourceExe=..\..\target\release\katak.exe
+        -o katak-windows-x64.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <!-- The UpgradeCode never changes: it is how a newer MSI finds and
+       replaces an installed older one. -->
+  <Package Name="Katak"
+           Manufacturer="Katak contributors"
+           Version="$(var.Version)"
+           UpgradeCode="AF5B87CA-544C-464F-90AB-4FC4D541FC9E"
+           Scope="perMachine">
+    <SummaryInformation Description="Katak - viewer and editor for huge CSV files" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Katak is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="katak.ico" SourceFile="..\..\crates\katak\assets\katak.ico" />
+    <Property Id="ARPPRODUCTICON" Value="katak.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Erkinbek/katak" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Erkinbek/katak/issues" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/Erkinbek/katak/releases" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Katak" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main">
+      <Component Directory="INSTALLFOLDER">
+        <File Id="KatakExe" Source="$(var.SourceExe)" Name="katak.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder">
+        <Shortcut Id="KatakShortcut" Name="Katak"
+                  Description="Viewer and editor for huge CSV files"
+                  Target="[INSTALLFOLDER]katak.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Katak" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- "Open with" for .csv, .tsv and .txt, as in the Inno Setup installer. -->
+      <Component Id="OpenWith" Directory="INSTALLFOLDER">
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\katak.exe">
+          <RegistryValue Name="FriendlyAppName" Type="string" Value="Katak" KeyPath="yes" />
+          <RegistryValue Key="shell\open\command" Type="string"
+                         Value="&quot;[INSTALLFOLDER]katak.exe&quot; &quot;%1&quot;" />
+          <RegistryValue Key="SupportedTypes" Name=".csv" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".tsv" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".txt" Type="string" Value="" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\.csv\OpenWithList\katak.exe"
+                     ForceCreateOnInstall="yes" ForceDeleteOnUninstall="yes" />
+        <RegistryKey Root="HKLM" Key="Software\Classes\.tsv\OpenWithList\katak.exe"
+                     ForceCreateOnInstall="yes" ForceDeleteOnUninstall="yes" />
+        <RegistryKey Root="HKLM" Key="Software\Classes\.txt\OpenWithList\katak.exe"
+                     ForceCreateOnInstall="yes" ForceDeleteOnUninstall="yes" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>

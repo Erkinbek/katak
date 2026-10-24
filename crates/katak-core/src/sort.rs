@@ -93,13 +93,10 @@ fn text_key(s: &str) -> u64 {
 fn fingerprint(b: &[u8]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut h = 0xCBF2_9CE4_8422_2325 ^ (b.len() as u64).wrapping_mul(K);
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        let mut w = [0u8; 8];
-        w.copy_from_slice(c);
+    let (words, rest) = b.as_chunks::<8>();
+    for &w in words {
         h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K).rotate_left(29);
     }
-    let rest = chunks.remainder();
     let mut w = [0u8; 8];
     w[..rest.len()].copy_from_slice(rest);
     h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K);

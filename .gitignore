@@ -8,6 +8,9 @@
 *.bak
 *.tmp
 
+# WiX extension cache (packaging/windows)
+.wix/
+
 # Editors / IDEs
 .vscode/
 .idea/

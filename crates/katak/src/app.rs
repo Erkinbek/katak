@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 use katak_core::index::IndexWarning;
@@ -67,6 +67,8 @@ impl Settings {
 /// `--screenshot`: what to capture and when.
 struct ShotPlan {
     path: PathBuf,
+    /// Time from the first paint to the capture.
+    delay: Duration,
     frames: usize,
     since: Option<Instant>,
     requested: bool,
@@ -153,6 +155,12 @@ impl KatakApp {
             perf: Perf::new(args.perf_log.clone(), args.self_test, started),
             shot: args.screenshot.clone().map(|path| ShotPlan {
                 path,
+                delay: Duration::from_millis(
+                    std::env::var("KATAK_SHOT_DELAY_MS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(800),
+                ),
                 frames: 0,
                 since: None,
                 requested: false,
@@ -1413,6 +1421,11 @@ impl KatakApp {
                     ui.heading(format!("Katak {}", env!("CARGO_PKG_VERSION")));
                     ui.label("A fast, non-freezing viewer/editor for huge delimited text files.");
                     ui.label("Katak means \"cell\" in Uzbek.");
+                    ui.hyperlink_to(
+                        "github.com/Erkinbek/katak",
+                        "https://github.com/Erkinbek/katak",
+                    );
+                    ui.weak("MIT License");
                     if let Some(b) = katak_core::sys::private_bytes() {
                         ui.weak(format!(
                             "Private memory: {}",
@@ -1446,7 +1459,7 @@ impl KatakApp {
         let Some(plan) = &mut self.shot else { return };
         let since = *plan.since.get_or_insert_with(Instant::now);
         // Let window animations finish.
-        if since.elapsed().as_millis() >= 800 && !plan.requested {
+        if since.elapsed() >= plan.delay && !plan.requested {
             plan.requested = true;
             let (path, done) = (plan.path.clone(), plan.done.clone());
             let repaint = ctx.clone();

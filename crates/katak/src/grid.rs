@@ -142,10 +142,8 @@ impl Columns {
     }
 
     fn remove(&mut self, at: usize) {
-        for v in [&mut self.widths] {
-            if at < v.len() {
-                v.remove(at);
-            }
+        if at < self.widths.len() {
+            self.widths.remove(at);
         }
         if at < self.types.len() {
             self.types.remove(at);

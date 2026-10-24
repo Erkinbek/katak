@@ -1,5 +1,10 @@
 # Task: Build "Katak" — a fast, non-freezing large-CSV viewer/editor
 
+> This is the original specification Katak was built from: requirements,
+> performance targets and the development process. How the code meets it is
+> described in [ARCHITECTURE.md](ARCHITECTURE.md); the measured numbers are
+> in the [README](../README.md#performance).
+
 ## Goal
 Build a desktop app called Katak (Uzbek for "cell") that opens huge delimited text files (CSV / TSV / any custom delimiter) of 1 GB, 10 GB, 50 GB+ instantly, lets the user choose the delimiter and parsing options by hand, shows the data as a clean, readable, scrollable table, and lets them search, filter, edit cells and save — without ever freezing or loading the whole file into memory.
 

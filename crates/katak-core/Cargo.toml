@@ -4,6 +4,11 @@ description = "File access, quote-aware sparse index, edit overlay, search and s
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["csv", "mmap", "index", "large-files", "parser"]
+categories = ["parser-implementations", "text-processing", "encoding"]
 publish = false
 
 [lints]

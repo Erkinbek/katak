@@ -4,6 +4,46 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-10-24 — First public release
+
+The first release published on GitHub, with binaries for Windows, macOS
+and Linux. Opening, editing and saving files work as in 0.5.0.
+
+### Added
+
+- Website at <https://erkinbek.github.io/katak/> (features, benchmarks,
+  downloads, FAQ), deployed from `site/` by the Website workflow.
+- Release assets with stable names, so `releases/latest/download/<name>`
+  links always get the newest build: `katak-windows-x64.exe`,
+  `katak-windows-x64-setup.exe`, `katak-linux-x64.tar.gz`,
+  `katak-macos-arm64.tar.gz`, `katak-macos-x64.tar.gz`, and
+  `SHA256SUMS.txt`. The archives keep the executable bit and include the
+  README and the license.
+- Windows packages: besides the portable `katak.exe` and the Inno Setup
+  installer, an MSI (`katak-windows-x64.msi`, WiX 5) for deployment with
+  Group Policy, Intune and similar tools. The Release workflow can be run
+  by hand to build every package without publishing.
+- The logo as the program icon: in Explorer, the Start menu and the
+  taskbar (embedded in `katak.exe` with version information, shown under
+  Properties → Details), for the window on every platform, and for the
+  installers.
+- Help → About links the project and names the license.
+- MIT license; CONTRIBUTING, CODE_OF_CONDUCT (Contributor Covenant 2.1),
+  SECURITY (private vulnerability reporting), issue forms and a pull
+  request template.
+- `KATAK_SHOT_DELAY_MS` waits longer before `--screenshot` captures.
+
+### Changed
+
+- The README is written for people who need to open a huge CSV file:
+  download links, screenshots in light and dark themes, the benchmark
+  table and an FAQ.
+- The original specification moved from `prompt.md` to `docs/SPEC.md`.
+- The Windows installer shows the license and links the project, puts
+  Katak directly in the Start menu (no folder, no uninstall shortcut:
+  Windows 10/11 uninstall from Settings → Apps) and refuses Windows
+  versions older than 10, which Rust programs no longer support.
+
 ## [0.5.0] — 2026-10-24 — Milestone 5: encodings, raw text, polish
 
 ### Added
