@@ -1413,6 +1413,11 @@ impl KatakApp {
                     ui.heading(format!("Katak {}", env!("CARGO_PKG_VERSION")));
                     ui.label("A fast, non-freezing viewer/editor for huge delimited text files.");
                     ui.label("Katak means \"cell\" in Uzbek.");
+                    ui.hyperlink_to(
+                        "github.com/Erkinbek/katak",
+                        "https://github.com/Erkinbek/katak",
+                    );
+                    ui.weak("MIT License");
                     if let Some(b) = katak_core::sys::private_bytes() {
                         ui.weak(format!(
                             "Private memory: {}",
