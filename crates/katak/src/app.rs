@@ -52,7 +52,6 @@ impl Default for Settings {
 /// `--screenshot`: what to capture and when.
 struct ShotPlan {
     path: PathBuf,
-    show: Option<String>,
     frames: usize,
     since: Option<Instant>,
     requested: bool,
@@ -79,6 +78,8 @@ pub struct KatakApp {
     picker: Option<Receiver<Vec<PathBuf>>>,
     perf: Perf,
     shot: Option<ShotPlan>,
+    /// `--show` action, run once the first file is painted.
+    pending_show: Option<String>,
 }
 
 impl KatakApp {
@@ -103,12 +104,12 @@ impl KatakApp {
             perf: Perf::new(args.perf_log.clone(), args.self_test, started),
             shot: args.screenshot.clone().map(|path| ShotPlan {
                 path,
-                show: args.show.clone(),
                 frames: 0,
                 since: None,
                 requested: false,
                 done: Arc::new(AtomicBool::new(false)),
             }),
+            pending_show: args.show.clone(),
         };
         let since = app.perf.since_start();
         app.perf.note(format!(
@@ -215,6 +216,28 @@ impl KatakApp {
         }
         if pressed(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::P)) {
             self.open_parse_dialog();
+        }
+        if pressed(sc(Modifiers::COMMAND, Key::F))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.search.open();
+        }
+        let notify = self.notify.clone();
+        if pressed(sc(Modifiers::SHIFT, Key::F3))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            crate::search_ui::jump(tab, false, &notify);
+        }
+        if pressed(sc(Modifiers::NONE, Key::F3))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            crate::search_ui::jump(tab, true, &notify);
+        }
+        if pressed(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::L))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            let c = tab.info.cursor_col;
+            tab.filter.toggle(c);
         }
         if pressed(sc(Modifiers::NONE, Key::F8)) {
             self.next_ragged();
@@ -333,6 +356,33 @@ impl KatakApp {
                     );
                 });
                 ui.weak("Zoom: Ctrl + / Ctrl - / Ctrl 0");
+            });
+            ui.menu_button("Search", |ui| {
+                let notify = self.notify.clone();
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    ui.weak("Open a file first");
+                    return;
+                };
+                if ui.button("Find…  Ctrl+F").clicked() {
+                    tab.search.open();
+                }
+                if ui.button("Find next  F3").clicked() {
+                    crate::search_ui::jump(tab, true, &notify);
+                }
+                if ui.button("Find previous  Shift+F3").clicked() {
+                    crate::search_ui::jump(tab, false, &notify);
+                }
+                ui.separator();
+                if ui.button("Filter…  Ctrl+Shift+L").clicked() {
+                    let c = tab.info.cursor_col;
+                    tab.filter.toggle(c);
+                }
+                if ui
+                    .add_enabled(tab.filter.run.is_some(), egui::Button::new("Clear filter"))
+                    .clicked()
+                {
+                    crate::filter_ui::clear(tab);
+                }
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("Keyboard shortcuts  F1").clicked() {
@@ -643,21 +693,6 @@ impl KatakApp {
             return;
         }
         plan.frames += 1;
-        let show = plan.show.clone();
-        if plan.frames == 2 {
-            match show.as_deref() {
-                Some("parse") => self.open_parse_dialog(),
-                Some("goto") => {
-                    self.goto = Some(GotoDialog {
-                        focus: true,
-                        text: "12400000".into(),
-                        ..GotoDialog::default()
-                    })
-                }
-                Some("shortcuts") => self.show_shortcuts = true,
-                _ => {}
-            }
-        }
         let Some(plan) = &mut self.shot else { return };
         let since = *plan.since.get_or_insert_with(Instant::now);
         // Let window animations finish.
@@ -673,6 +708,41 @@ impl KatakApp {
             });
         }
     }
+
+    /// `--show`: open a dialog or run a search/filter (screenshots, self-test).
+    fn run_show(&mut self, show: Option<&str>) {
+        {
+            match show {
+                Some("parse") => self.open_parse_dialog(),
+                Some("goto") => {
+                    self.goto = Some(GotoDialog {
+                        focus: true,
+                        text: "12400000".into(),
+                        ..GotoDialog::default()
+                    })
+                }
+                Some("shortcuts") => self.show_shortcuts = true,
+                Some(s) if s.starts_with("search=") => {
+                    let notify = self.notify.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.search.open();
+                        tab.search.query = s["search=".len()..].to_string();
+                        crate::search_ui::jump(tab, true, &notify);
+                    }
+                }
+                Some(s) if s.starts_with("filter=") => {
+                    let notify = self.notify.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active)
+                        && let Some((col, text)) = s["filter=".len()..].split_once(':')
+                    {
+                        let col = col.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                        crate::filter_ui::apply_quick(tab, &notify, col, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -682,6 +752,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Shift+P", "Parsing options"),
     ("Ctrl+G", "Go to row"),
     ("Ctrl+Shift+G", "Go to byte offset"),
+    ("Ctrl+F", "Find"),
+    ("F3 / Shift+F3", "Next / previous match"),
+    ("Ctrl+Shift+L", "Filter bar"),
     ("F8", "Next ragged row"),
     ("Arrows", "Move the cursor (Shift extends the selection)"),
     ("PgUp / PgDn", "Page up / down"),
@@ -727,6 +800,19 @@ impl eframe::App for KatakApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.banner(ui));
         }
+        let notify = self.notify.clone();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            crate::search_ui::tick(tab, &notify);
+            crate::filter_ui::tick(tab);
+            if tab.search.open {
+                egui::Panel::top("search").show(ui, |ui| crate::search_ui::bar(ui, tab, &notify));
+            }
+            if tab.filter.open {
+                let columns = tab.info.columns;
+                egui::Panel::top("filter")
+                    .show(ui, |ui| crate::filter_ui::bar(ui, tab, &notify, columns));
+            }
+        }
 
         let colors = GridColors::from_visuals(&ctx.global_style().visuals);
         let (font_size, mono) = (self.settings.font_size, self.settings.monospace);
@@ -745,6 +831,12 @@ impl eframe::App for KatakApp {
             egui::Panel::bottom("status").show(ui, |ui| {
                 crate::status::show(ui, tab, &stats, name.as_deref())
             });
+            if tab.search.open && tab.search.show_results && tab.search.run.is_some() {
+                egui::Panel::bottom("results")
+                    .resizable(true)
+                    .default_size(180.0)
+                    .show(ui, |ui| crate::search_ui::results(ui, tab));
+            }
             ctx.send_viewport_cmd(ViewportCommand::Title(format!("{} — Katak", tab.title)));
         }
 
@@ -762,6 +854,9 @@ impl eframe::App for KatakApp {
                 if let Some((rec, col)) = info.double_clicked {
                     tab.open_cell(rec, col);
                 }
+                if let Some(c) = info.filter_column {
+                    tab.filter.add_column(c);
+                }
                 tab.info = info;
             } else {
                 self.welcome(ui);
@@ -769,6 +864,14 @@ impl eframe::App for KatakApp {
         });
 
         self.dialogs(&ctx);
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.first_paint.is_some())
+            && let Some(show) = self.pending_show.take()
+        {
+            self.run_show(Some(&show));
+        }
 
         // Scripted self-test.
         if let Some(tab) = self.tabs.get_mut(self.active)
