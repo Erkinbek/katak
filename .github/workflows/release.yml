@@ -20,20 +20,16 @@ jobs:
           - name: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            exe: katak.exe
           - name: linux-x64
             # The oldest supported runner keeps the glibc requirement low.
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            exe: katak
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            exe: katak
           - name: macos-x64
             os: macos-latest
             target: x86_64-apple-darwin
-            exe: katak
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,13 +51,20 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p katak --target ${{ matrix.target }}
 
+      # Asset names carry no version, so .../releases/latest/download/<name>
+      # (linked from the README and the website) always gets the newest build.
+      # Archives keep the executable bit on Linux and macOS.
       - name: Package binary
         shell: bash
         run: |
           mkdir -p dist
-          ext=""
-          [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
-          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "dist/katak-${{ github.ref_name }}-${{ matrix.name }}${ext}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/katak.exe" "dist/katak-${{ matrix.name }}.exe"
+          else
+            mkdir -p "pkg/katak"
+            cp "target/${{ matrix.target }}/release/katak" README.md LICENSE pkg/katak/
+            tar -C pkg -czf "dist/katak-${{ matrix.name }}.tar.gz" katak
+          fi
 
       - name: Build Windows installer
         if: runner.os == 'Windows'
@@ -69,7 +72,7 @@ jobs:
         run: |
           choco install innosetup --no-progress -y
           $version = "${{ github.ref_name }}".TrimStart("v")
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceExe=$PWD\target\${{ matrix.target }}\release\katak.exe" "/O$PWD\dist" "/Fkatak-${{ github.ref_name }}-windows-x64-setup" packaging\windows\katak.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceExe=$PWD\target\${{ matrix.target }}\release\katak.exe" "/O$PWD\dist" "/Fkatak-${{ matrix.name }}-setup" packaging\windows\katak.iss
 
       - uses: actions/upload-artifact@v4
         with:
@@ -87,9 +90,15 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The checkout has the tag as a plain ref; fetch the annotated tag
+          # object, whose message becomes the release notes.
+          git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           notes=$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")
           gh release create "${GITHUB_REF_NAME}" dist/* --title "Katak ${GITHUB_REF_NAME}" --notes "${notes:-Katak ${GITHUB_REF_NAME}}"
