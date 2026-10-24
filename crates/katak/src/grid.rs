@@ -41,6 +41,25 @@ pub const COPY_CONFIRM_BYTES: usize = 100 << 20;
 const COPY_MAX_BYTES: usize = 1 << 30;
 /// Column operations rebuild the column order list.
 const MAX_COLUMN_OPS: usize = 100_000;
+/// Largest selection summarized in the status bar (read once, cached).
+const MAX_STATS_CELLS: u64 = 20_000;
+
+/// Count, sum, minimum and maximum of a selection, for the status bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SelStats {
+    pub rows: u64,
+    pub cols: u64,
+    /// Non-empty cells (`None`: too many cells to read).
+    pub filled: Option<u64>,
+    pub numbers: u64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// What a cached summary was computed for: selection box, list view,
+/// document and overlay generations.
+type StatsKey = (u64, u64, usize, usize, bool, u64, u64);
 
 /// Column widths (and their prefix sums) and inferred types.
 #[derive(Default)]
@@ -223,6 +242,8 @@ pub struct GridInfo {
     pub confirm_copy: Option<String>,
     pub message: Option<String>,
     pub editing: bool,
+    /// Summary of a multi-cell selection.
+    pub selection: Option<SelStats>,
 }
 
 /// Which rows the grid shows.
@@ -340,6 +361,7 @@ pub struct Grid {
     out: GridInfo,
     /// Layout to restore after the document is re-read (save, Save As).
     restore: Option<(Columns, usize, f32, u64, usize)>,
+    stats: Option<(StatsKey, SelStats)>,
 }
 
 impl Grid {
@@ -384,6 +406,7 @@ impl Grid {
             actions: Vec::new(),
             out: GridInfo::default(),
             restore: None,
+            stats: None,
         }
     }
 
@@ -1809,7 +1832,67 @@ impl Grid {
         self.out.cursor_col = self.cursor_col;
         self.out.columns = ncols;
         self.out.editing = self.editor.is_some();
+        // Not while a mouse drag is still changing the selection.
+        let settled = !ui.input(|i| i.pointer.any_down());
+        self.out.selection = self.selection_stats(doc, settled);
         std::mem::take(&mut self.out)
+    }
+
+    /// Summary of the selection (cached until it or the data changes).
+    fn selection_stats(&mut self, doc: &mut Document, settled: bool) -> Option<SelStats> {
+        self.anchor?;
+        let (r0, r1, c0, c1) = self.selection_box();
+        let (rows, cols) = (r1 - r0 + 1, (c1 - c0 + 1) as u64);
+        if rows * cols < 2 {
+            return None;
+        }
+        let key = (
+            r0,
+            r1,
+            c0,
+            c1,
+            self.is_list(),
+            doc.generation(),
+            doc.overlay.generation(),
+        );
+        if let Some((k, v)) = self.stats
+            && k == key
+        {
+            return Some(v);
+        }
+        if !settled {
+            return None;
+        }
+        let mut s = SelStats {
+            rows,
+            cols,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            ..SelStats::default()
+        };
+        if rows * cols <= MAX_STATS_CELLS {
+            // Rows still loading from a slow drive: try again next frame.
+            let list = self.selected_rows(doc, MAX_STATS_CELLS).ok()?;
+            let mut filled = 0;
+            for row in &list {
+                let cells = doc.display_cells(row, c0..c1 + 1, 64).ok()?;
+                for (cell, _) in cells {
+                    if cell.missing || cell.text.is_empty() {
+                        continue;
+                    }
+                    filled += 1;
+                    if let Some(x) = infer::parse_number(&cell.text) {
+                        s.numbers += 1;
+                        s.sum += x;
+                        s.min = s.min.min(x);
+                        s.max = s.max.max(x);
+                    }
+                }
+            }
+            s.filled = Some(filled);
+        }
+        self.stats = Some((key, s));
+        Some(s)
     }
 
     fn set_cursor_row(&mut self, g: &GRow) {

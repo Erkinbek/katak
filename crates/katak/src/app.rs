@@ -138,6 +138,7 @@ impl KatakApp {
         // blocks load in the background and the grid shows "loading".
         katak_core::source::set_nonblocking_reads(true);
         let watcher = crate::watch::Watcher::start(notify.clone());
+        crate::fonts::load_fallbacks(cc.egui_ctx.clone());
         let mut app = KatakApp {
             tabs: Vec::new(),
             active: 0,
@@ -1518,6 +1519,11 @@ impl KatakApp {
                     }
                 }
                 Some("export") => self.open_export(None),
+                Some("selectall") => {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.grid.action(EditAction::SelectAll);
+                    }
+                }
                 Some(s) if s.starts_with("exportto=") => {
                     let notify = self.notify.clone();
                     if let Some(tab) = self.tabs.get_mut(self.active) {

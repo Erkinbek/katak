@@ -9,7 +9,7 @@
 //! programmatically for a few seconds and exits; it is how the frame-time
 //! targets are measured. `--screenshot PNG` saves the window contents
 //! once the first file is shown (optionally with a dialog open or an
-//! action run: `parse`, `parse-raw`, `goto`, `shortcuts`, `edit`, `export`, `exportto=PATH`,
+//! action run: `parse`, `parse-raw`, `goto`, `shortcuts`, `edit`, `export`, `exportto=PATH`, `selectall`,
 //! `search=TEXT`, `filter=COL:TEXT`, `replace=FIND:WITH`, `replaceall=FIND:WITH`,
 //! `sort=COL:asc|desc`) and exits.
 
@@ -19,6 +19,7 @@
 mod app;
 mod export_ui;
 mod filter_ui;
+mod fonts;
 mod grid;
 mod parse_dialog;
 mod perf;
