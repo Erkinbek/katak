@@ -396,6 +396,9 @@ fn short_rows(dir: &Path) -> io::Result<u64> {
 
 type Generator = fn(&Path) -> io::Result<u64>;
 
+/// Generators that only run when named with `--only` (they are huge).
+const OPT_IN: &[&str] = &["big_50g"];
+
 fn generators() -> Vec<(&'static str, &'static str, Generator)> {
     vec![
         (
@@ -407,6 +410,11 @@ fn generators() -> Vec<(&'static str, &'static str, Generator)> {
             "big_10g",
             "big_10g.csv: 10 GB, quoted multi-line fields",
             |d| big_csv(d, "big_10g.csv", 10 * GB),
+        ),
+        (
+            "big_50g",
+            "big_50g.csv: 50 GB, quoted multi-line fields (only with --only)",
+            |d| big_csv(d, "big_50g.csv", 50 * GB),
         ),
         (
             "wide_10k",
@@ -484,7 +492,11 @@ fn main() -> io::Result<()> {
     }
     std::fs::create_dir_all(&out)?;
     for (name, desc, generate) in generators() {
-        if only.as_ref().is_some_and(|o| !o.iter().any(|n| n == name)) {
+        let selected = match &only {
+            Some(o) => o.iter().any(|n| n == name),
+            None => !OPT_IN.contains(&name),
+        };
+        if !selected {
             continue;
         }
         let t = Instant::now();
