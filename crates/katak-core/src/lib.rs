@@ -7,9 +7,12 @@
 pub mod dialect;
 pub mod encoding;
 pub mod fields;
+pub mod job;
 pub mod scan;
+pub mod source;
 pub mod units;
 
 pub use dialect::{Compiled, Delimiter, Dialect, DialectError, Escape};
 pub use encoding::TextEncoding;
 pub use scan::{RecSpan, Term};
+pub use source::{AccessMode, Source};
