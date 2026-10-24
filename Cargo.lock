@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "katak"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "katak-core",
@@ -1551,14 +1551,14 @@ dependencies = [
 
 [[package]]
 name = "katak-bench"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "katak-core",
 ]
 
 [[package]]
 name = "katak-core"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytecount",
  "chardetng",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "katak-gen"
-version = "0.1.0"
+version = "0.4.0"
 
 [[package]]
 name = "khronos_api"

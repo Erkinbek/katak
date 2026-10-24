@@ -10,6 +10,7 @@ use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::detect::{self, Detection, SAMPLE_BYTES};
@@ -84,6 +85,13 @@ struct FieldIndex {
     complete: bool,
 }
 
+/// Generations are unique across documents, so state tied to one (a
+/// filter, a sort) is never mistaken for another's after Save As.
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// An open file.
 pub struct Document {
     source: Arc<Source>,
@@ -146,7 +154,7 @@ impl Document {
             field_budget: FIELD_BUDGET,
             fields_pending: false,
             tick: 0,
-            generation: 0,
+            generation: next_generation(),
             opened: Instant::now(),
             sample_avg: None,
             access: opts.access,
@@ -164,7 +172,7 @@ impl Document {
         self.data_start = data_start_for(&self.source, &self.sample, &dialect)?;
         self.dialect = dialect;
         self.compiled = compiled;
-        self.generation += 1;
+        self.generation = next_generation();
         self.restart_index();
         Ok(())
     }
@@ -268,6 +276,18 @@ impl Document {
     /// Time since the document was opened.
     pub fn age(&self) -> Duration {
         self.opened.elapsed()
+    }
+
+    /// A locator of its own for a background job (export of a selection).
+    pub fn job_locator(&self) -> Locator {
+        let (expected, avg) = self.sample_shape();
+        Locator::new(
+            self.source.clone(),
+            self.compiled.clone(),
+            self.index.clone(),
+            expected,
+            avg,
+        )
     }
 
     /// What background jobs (search, filter) need to scan this document.
@@ -486,7 +506,7 @@ impl Document {
         self.source = source;
         self.sample = sample.into();
         self.overlay.clear();
-        self.generation += 1;
+        self.generation = next_generation();
         self.restart_index();
         Ok(())
     }
@@ -670,6 +690,24 @@ impl Document {
         let mut originals = HashMap::new();
         for (r, c, _) in &mapped {
             if let RowRef::Src(_) = r {
+                originals.insert((*r, *c), self.original(*r, *c));
+            }
+        }
+        self.overlay
+            .set_cells(mapped, |r, c| originals.get(&(r, c)).cloned().flatten());
+    }
+
+    /// Like [`Document::set_values`] for values known to differ from the
+    /// current ones (Replace All): only cells that already have an edit
+    /// need their source value read, so that restoring it drops the edit.
+    pub fn set_changed_values(&mut self, changes: Vec<(RowRef, usize, String)>) {
+        let mapped: Vec<(RowRef, ColRef, String)> = changes
+            .into_iter()
+            .map(|(r, c, v)| (r, self.overlay.col_ref(c), v))
+            .collect();
+        let mut originals = HashMap::new();
+        for (r, c, _) in &mapped {
+            if matches!(r, RowRef::Src(_)) && self.overlay.cell(*r, *c).is_some() {
                 originals.insert((*r, *c), self.original(*r, *c));
             }
         }

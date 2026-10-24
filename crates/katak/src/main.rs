@@ -8,18 +8,22 @@
 //! times) to LOG. `--self-test` additionally scrolls the first file
 //! programmatically for a few seconds and exits; it is how the frame-time
 //! targets are measured. `--screenshot PNG` saves the window contents
-//! once the first file is shown (optionally with a dialog open: `parse`,
-//! `goto`, `shortcuts`) and exits.
+//! once the first file is shown (optionally with a dialog open or an
+//! action run: `parse`, `goto`, `shortcuts`, `edit`, `export`, `exportto=PATH`,
+//! `search=TEXT`, `filter=COL:TEXT`, `replace=FIND:WITH`, `replaceall=FIND:WITH`,
+//! `sort=COL:asc|desc`) and exits.
 
 // No console window for release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod export_ui;
 mod filter_ui;
 mod grid;
 mod parse_dialog;
 mod perf;
 mod search_ui;
+mod sort_ui;
 mod status;
 mod tab;
 mod theme;
@@ -62,7 +66,9 @@ fn main() -> eframe::Result {
             .with_min_inner_size([480.0, 320.0])
             .with_drag_and_drop(true)
             .with_icon(theme::app_icon()),
-        persist_window: true,
+        // Scripted runs (screenshots, self-test) use the default size and
+        // leave the user's window geometry alone.
+        persist_window: args.screenshot.is_none() && !args.self_test,
         ..Default::default()
     };
     eframe::run_native(

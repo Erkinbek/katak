@@ -20,7 +20,7 @@ The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | 1 | open, parsing dialog, virtualized grid, scrolling, go to row/offset | **done** (v0.1.0) |
 | 2 | search and filter | **done** (v0.2.0) |
 | 3 | edit overlay, undo/redo, save with byte-identical round trip | **done** (v0.3.0) |
-| 4 | find/replace, sort, export conversions | planned |
+| 4 | find/replace, sort, export conversions | **done** (v0.4.0) |
 | 5 | encodings, raw-text mode, polish | planned |
 
 ## Features
@@ -84,6 +84,24 @@ The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   and line ending. Optional `.bak` copy; Save As (Ctrl+Shift+S). A failed
   or cancelled save never touches the original, and "file is open in
   another program" / read-only / disk-full errors are explained.
+* **Replace** (Ctrl+H): replace in the current cell and move to the next
+  match, or Replace all — with regex capture groups (`$1`, `${name}`).
+  Up to 50,000 changed cells become one undoable edit; above that Katak
+  offers to rewrite the file in one streaming pass (only rows with a match
+  are rewritten, a `.bak` is kept by default).
+* **Sort** (right-click a column header): ascending or descending, as
+  numbers (`.` or `,` decimals), dates or text depending on the column
+  type; values that do not parse go last, equal values keep file order.
+  The sort runs in the background and is shown as a view — the file is not
+  reordered. A filtered view sorts only the matching rows. Memory is
+  bounded by a budget (32 bytes per row, 512 MB by default, View → Sort
+  memory budget).
+* **Export / convert** (File menu, Ctrl+E): all rows, the filtered and/or
+  sorted rows ("Save sorted as…" applies the sort order) or the selection
+  (optionally only its columns), with another delimiter, quote character,
+  quoting policy, escape style, encoding (with or without BOM) or line
+  ending. Edits are included; the export streams with bounded memory and
+  can be opened in a new tab.
 
 ## Building
 
@@ -102,7 +120,7 @@ The binary is `target/release/katak` (`katak.exe` on Windows).
   default) with the "Desktop development with C++" build tools. The
   resulting `katak.exe` is portable. The optional installer is built with
   [Inno Setup](https://jrsoftware.org/isinfo.php):
-  `ISCC.exe /DAppVersion=0.1.0 packaging\windows\katak.iss`.
+  `ISCC.exe /DAppVersion=0.4.0 packaging\windows\katak.iss`.
 * **Linux**: install the X11/Wayland headers egui needs, e.g. on Debian or
   Ubuntu `sudo apt install libxcb-render0-dev libxcb-shape0-dev
   libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev`. File dialogs use
@@ -131,9 +149,11 @@ Or start Katak and use File → Open, or drop files on the window.
 | Ctrl+Tab | Next tab |
 | Ctrl+Shift+P | Parsing options |
 | Ctrl+F | Find |
+| Ctrl+H | Replace |
 | F3 / Shift+F3 | Next / previous match |
 | Ctrl+Shift+L | Filter bar |
 | Ctrl+S / Ctrl+Shift+S | Save / Save as |
+| Ctrl+E | Export / convert |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | F2, double-click, typing | Edit the cell |
 | Enter / Tab / Esc (editing) | Commit and move down / right, cancel |
@@ -149,7 +169,7 @@ Or start Katak and use File → Open, or drop files on the window.
 | Shift+mouse wheel | Scroll horizontally |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
 | Right-click a cell | Rows, columns, clipboard, filter |
-| Right-click a column header | Filter this column, auto-fit, freeze, column type |
+| Right-click a column header | Sort, filter this column, auto-fit, freeze, column type |
 | F1 | Shortcut list |
 
 ## Performance
@@ -183,12 +203,18 @@ files in the OS cache, release build. Files come from `tools/katak-gen`.
 | Save, zero edits (10 GB) | byte-identical | **identical, 1.54 GB/s** |
 | Save with a handful of edits (10 GB): private memory | < 300 MB | **29 MB peak** |
 | Save with a handful of edits (10 GB): throughput | disk-bound | **554 MB/s** (the disk was flushing the previous 10 GB write; 1.3 GB/s for 1 GB) |
+| Sort 12 M rows (1 GB): numbers / few-valued text / all-distinct text | default 512 MB budget | **1.19 s / 1.59 s / 3.8 s**, 414 MB peak |
+| Sort 119 M rows (10 GB), 8 GB budget: numbers / text | bounded memory | **14.1 s / 15.1 s**, 3.6 GB peak (refused at 512 MB with the size needed) |
+| UI time per frame in a sorted 12 M-row view | < 16 ms | **max 3.7 ms** |
+| Export to TSV + CRLF, 1 GB / 10 GB | streaming | **355–362 MB/s / 356–400 MB/s**, 53 MB peak |
+| Export in sort order, 1 GB / 10 GB | no random reads | **7.0 s / 72 s** |
+| Replace all as a streaming rewrite (~10 % of rows), 10 GB | streaming | **349–399 MB/s**, 62 MB peak |
 
 Reproduce with:
 
 ```sh
 cargo run --release -p katak-gen                       # writes testdata/generated/ (~12 GB)
-cargo run --release -p katak-bench -- testdata/generated/big_10g.csv --suite --save
+cargo run --release -p katak-bench -- testdata/generated/big_10g.csv --suite --save --convert
 target/release/katak testdata/generated/big_10g.csv --perf perf.log --self-test
 ```
 

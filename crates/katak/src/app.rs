@@ -9,13 +9,16 @@ use std::time::Instant;
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText, ViewportCommand};
 use katak_core::index::IndexWarning;
 use katak_core::job::Notify;
+use katak_core::search::Matcher;
 use serde::{Deserialize, Serialize};
 
 use crate::Args;
+use crate::export_ui::{ExportAction, ExportDialog, Rows};
 use crate::grid::{EditAction, GridCommand, group};
 use crate::parse_dialog::{ParseAction, ParseDialog};
 use crate::perf::Perf;
-use crate::tab::Tab;
+use crate::search_ui::ReplaceOutcome;
+use crate::tab::{Tab, WriteKind};
 use crate::theme::GridColors;
 
 const SETTINGS_KEY: &str = "katak-settings";
@@ -38,6 +41,8 @@ pub struct Settings {
     pub recent: Vec<PathBuf>,
     /// Keep the previous version as `name.bak` when saving.
     pub backup: bool,
+    /// Memory a sort may use, in MB.
+    pub sort_budget_mb: u64,
 }
 
 impl Default for Settings {
@@ -48,7 +53,14 @@ impl Default for Settings {
             monospace: false,
             recent: Vec::new(),
             backup: false,
+            sort_budget_mb: katak_core::sort::DEFAULT_BUDGET >> 20,
         }
+    }
+}
+
+impl Settings {
+    fn sort_budget(&self) -> u64 {
+        self.sort_budget_mb.clamp(64, 1 << 20) << 20
     }
 }
 
@@ -69,6 +81,14 @@ enum Confirm {
     Quit,
     /// Drop all edits of the active tab.
     Discard,
+    /// Replace All found more cells than are kept as edits: rewrite the
+    /// file of tab `tab` instead.
+    Rewrite {
+        tab: usize,
+        matcher: Arc<Matcher>,
+        with: String,
+        backup: bool,
+    },
 }
 
 #[derive(Default)]
@@ -273,6 +293,14 @@ impl KatakApp {
         {
             tab.search.open();
         }
+        if pressed(sc(Modifiers::COMMAND, Key::H))
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.search.open_replace();
+        }
+        if pressed(sc(Modifiers::COMMAND, Key::E)) {
+            self.open_export(None);
+        }
         let notify = self.notify.clone();
         if pressed(sc(Modifiers::SHIFT, Key::F3))
             && let Some(tab) = self.tabs.get_mut(self.active)
@@ -366,52 +394,94 @@ impl KatakApp {
         tab.start_save(target, backup, notify);
     }
 
-    /// Finishes saves whose jobs have ended.
+    /// Finishes saves, rewrites and exports whose jobs have ended.
     fn poll_saves(&mut self) {
         let notify = self.notify.clone();
+        let mut to_open = Vec::new();
         for tab in &mut self.tabs {
-            let Some(sj) = &tab.save else { continue };
-            if sj.job.is_running() {
-                continue;
-            }
-            let res = sj.result.lock().ok().and_then(|mut r| r.take());
-            let target = sj.target.clone();
-            let job_error = sj.job.error();
-            tab.save = None;
-            match res {
-                Some(Ok(report)) => {
-                    let outcome = if target == tab.path {
-                        tab.grid.reload_keep_layout();
-                        tab.doc.reopen().map_err(|e| e.to_string())
-                    } else {
-                        tab.retarget(&target, notify.clone())
-                    };
-                    if let Err(e) = outcome {
+            let finished: Vec<crate::tab::SaveJob> = [&mut tab.save, &mut tab.export]
+                .into_iter()
+                .filter_map(|slot| slot.take_if(|j| !j.job.is_running()))
+                .collect();
+            for sj in finished {
+                let res = sj.result.lock().ok().and_then(|mut r| r.take());
+                let job_error = sj.job.error();
+                let report = match res {
+                    Some(Ok(report)) => report,
+                    Some(Err(e)) => {
+                        self.messages.push(match sj.kind {
+                            WriteKind::Export { .. } => format!("Export failed: {e}"),
+                            _ => e,
+                        });
+                        continue;
+                    }
+                    None => {
                         self.messages
-                            .push(format!("Saved, but reopening the file failed: {e}"));
+                            .push(job_error.unwrap_or_else(|| {
+                                match sj.kind {
+                                    WriteKind::Export { .. } => "The export was cancelled.".into(),
+                                    _ => {
+                                        "The save was cancelled. The original file was not changed."
+                                            .into()
+                                    }
+                                }
+                            }));
+                        continue;
                     }
-                    if report.unmappable > 0 {
+                };
+                match sj.kind {
+                    WriteKind::Save | WriteKind::Rewrite => {
+                        let outcome = if sj.target == tab.path {
+                            tab.grid.reload_keep_layout();
+                            tab.doc.reopen().map_err(|e| e.to_string())
+                        } else {
+                            tab.retarget(&sj.target, notify.clone())
+                        };
+                        if let Err(e) = outcome {
+                            self.messages
+                                .push(format!("Saved, but reopening the file failed: {e}"));
+                        }
+                        if sj.kind == WriteKind::Rewrite {
+                            tab.search.reset();
+                            self.messages.push(format!(
+                                "Replace All rewrote {} rows.",
+                                group(report.records_rewritten)
+                            ));
+                        }
+                    }
+                    WriteKind::Export { open } => {
                         self.messages.push(format!(
-                            "{} characters cannot be represented in {} and were written as \"?\".",
-                            report.unmappable,
-                            tab.doc.dialect().encoding.name()
+                            "Exported {} rows ({}) to {}.",
+                            group(report.records_rewritten),
+                            katak_core::sys::human_bytes(report.bytes_written),
+                            sj.target.display()
                         ));
+                        if open {
+                            to_open.push(sj.target.clone());
+                        }
                     }
-                    if report.used_fallback_quote {
-                        self.messages.push("Some values needed quoting but the file has no quote character; \" was used.".into());
-                    }
-                    self.perf.note(format!(
-                        "saved {}: {} bytes, {} records rewritten",
-                        target.display(),
-                        report.bytes_written,
-                        report.records_rewritten
+                }
+                if report.unmappable > 0 {
+                    self.messages.push(format!(
+                        "{} characters cannot be represented in the target encoding and were written as \"?\".",
+                        group(report.unmappable as u64)
                     ));
                 }
-                Some(Err(e)) => self.messages.push(e),
-                None => self.messages.push(job_error.unwrap_or_else(|| {
-                    "The save was cancelled. The original file was not changed.".into()
-                })),
+                if report.used_fallback_quote {
+                    self.messages.push("Some values needed quoting but the file has no quote character; \" was used.".into());
+                }
+                self.perf.note(format!(
+                    "{} {}: {} bytes, {} records written in {:.2} s",
+                    sj.kind.verb(),
+                    sj.target.display(),
+                    report.bytes_written,
+                    report.records_rewritten,
+                    sj.job.elapsed().as_secs_f64()
+                ));
             }
+        }
+        for p in to_open {
+            self.open(p);
         }
         if self.quit_after_save && self.tabs.iter().all(|t| t.save.is_none()) {
             self.quit_after_save = false;
@@ -428,6 +498,18 @@ impl KatakApp {
     fn open_parse_dialog(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.parse_dialog = Some(ParseDialog::new(tab.doc.dialect()));
+        }
+    }
+
+    /// File → Export (optionally with the rows preselected).
+    fn open_export(&mut self, rows: Option<Rows>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.grid.commit(&mut tab.doc);
+            let mut d = ExportDialog::new(tab);
+            if let Some(r) = rows {
+                d.rows = r;
+            }
+            tab.export_dialog = Some(d);
         }
     }
 
@@ -481,6 +563,21 @@ impl KatakApp {
                     self.save_active(true);
                 }
                 ui.checkbox(&mut self.settings.backup, "Keep a .bak copy when saving");
+                ui.separator();
+                if ui
+                    .add_enabled(has, egui::Button::new("Export / convert…  Ctrl+E"))
+                    .on_hover_text("Write all rows, the filtered or sorted rows, or the selection with another delimiter, quoting, encoding or line ending")
+                    .clicked()
+                {
+                    self.open_export(None);
+                }
+                let sorted = self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|t| t.sort.as_ref().is_some_and(|s| s.is_shown()));
+                if sorted && ui.button("Save sorted as…").clicked() {
+                    self.open_export(Some(Rows::View));
+                }
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -637,6 +734,17 @@ impl KatakApp {
                     );
                 });
                 ui.weak("Zoom: Ctrl + / Ctrl - / Ctrl 0");
+                ui.separator();
+                ui.menu_button("Sort memory budget", |ui| {
+                    for mb in [256u64, 512, 1024, 2048, 4096, 8192] {
+                        let label = format!(
+                            "{} (about {} rows)",
+                            katak_core::sys::human_bytes(mb << 20),
+                            group((mb << 20) / katak_core::sort::BYTES_PER_ROW)
+                        );
+                        ui.radio_value(&mut self.settings.sort_budget_mb, mb, label);
+                    }
+                });
             });
             ui.menu_button("Search", |ui| {
                 let notify = self.notify.clone();
@@ -653,6 +761,9 @@ impl KatakApp {
                 if ui.button("Find previous  Shift+F3").clicked() {
                     crate::search_ui::jump(tab, false, &notify);
                 }
+                if ui.button("Replace…  Ctrl+H").clicked() {
+                    tab.search.open_replace();
+                }
                 ui.separator();
                 if ui.button("Filter…  Ctrl+Shift+L").clicked() {
                     let c = tab.info.cursor_col;
@@ -664,6 +775,16 @@ impl KatakApp {
                 {
                     crate::filter_ui::clear(tab);
                 }
+                if ui
+                    .add_enabled(
+                        tab.sort.is_some() || tab.sort_pending.is_some(),
+                        egui::Button::new("Clear sort"),
+                    )
+                    .clicked()
+                {
+                    crate::sort_ui::clear(tab);
+                }
+                ui.weak("Sort: right-click a column header");
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("Keyboard shortcuts  F1").clicked() {
@@ -974,6 +1095,61 @@ impl KatakApp {
                 self.rename = None;
             }
         }
+        // Export.
+        let open_paths: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && let Some(mut dlg) = tab.export_dialog.take()
+        {
+            match dlg.show(ctx, tab, &open_paths, &self.notify) {
+                ExportAction::None => tab.export_dialog = Some(dlg),
+                ExportAction::Close | ExportAction::Started => {}
+            }
+        }
+        // Replace All rewrite.
+        if let Some(Confirm::Rewrite { tab, backup, .. }) = &mut self.confirm {
+            let i = *tab;
+            let name = self.tabs.get(i).map_or("the file", |t| t.title.as_str());
+            let mut answer = None;
+            egui::Modal::new(egui::Id::unique("katak-rewrite")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!(
+                    "More than {} cells match. Instead of keeping that many undoable edits, Replace All can rewrite {name} on disk in one pass.",
+                    group(katak_core::replace::DEFAULT_THRESHOLD as u64)
+                ));
+                ui.label("Only rows with a match are rewritten; everything else is copied byte for byte. This cannot be undone with Ctrl+Z.");
+                ui.checkbox(backup, "Keep the current version as a .bak file");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Rewrite the file").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if let Some(a) = answer
+                && let Some(Confirm::Rewrite {
+                    tab,
+                    matcher,
+                    with,
+                    backup,
+                }) = self.confirm.take()
+                && a
+            {
+                let notify = self.notify.clone();
+                match self.tabs.get_mut(tab) {
+                    Some(t) if t.dirty() => self.messages.push(
+                        "Save or discard your edits first, then run Replace All again.".into(),
+                    ),
+                    Some(t) if t.save.is_some() => {
+                        self.messages.push("A save is still running.".into())
+                    }
+                    Some(t) => t.start_rewrite(matcher, with, backup, notify),
+                    None => {}
+                }
+            }
+        }
         // Large clipboard copy.
         if let Some(text) = &self.pending_copy {
             let mut answer = None;
@@ -999,7 +1175,9 @@ impl KatakApp {
             }
         }
         // Unsaved changes.
-        if let Some(c) = &self.confirm {
+        if let Some(c) = &self.confirm
+            && !matches!(c, Confirm::Rewrite { .. })
+        {
             let (question, save_label, drop_label) = match c {
                 Confirm::CloseTab(i) => (
                     format!(
@@ -1019,6 +1197,7 @@ impl KatakApp {
                     "",
                     "Discard",
                 ),
+                Confirm::Rewrite { .. } => unreachable!(),
             };
             let mut answer = None;
             egui::Modal::new(egui::Id::unique("katak-confirm")).show(ctx, |ui| {
@@ -1130,6 +1309,8 @@ impl KatakApp {
             || self.tabs.is_empty();
         let Some(plan) = &mut self.shot else { return };
         if plan.done.load(Ordering::Relaxed) {
+            // Scripted run: quit even with unsaved edits.
+            self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
@@ -1203,6 +1384,46 @@ impl KatakApp {
                         crate::search_ui::jump(tab, true, &notify);
                     }
                 }
+                Some("export") => self.open_export(None),
+                Some(s) if s.starts_with("exportto=") => {
+                    let notify = self.notify.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let path = PathBuf::from(&s["exportto=".len()..]);
+                        let mut d = ExportDialog::new(tab);
+                        self.messages.extend(d.export_tsv(tab, path, &notify));
+                    }
+                }
+                Some(s) if s.starts_with("replace=") => {
+                    let notify = self.notify.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active)
+                        && let Some((find, with)) = s["replace=".len()..].split_once(':')
+                    {
+                        tab.search.open_replace();
+                        tab.search.query = find.to_string();
+                        tab.search.with = with.to_string();
+                        crate::search_ui::jump(tab, true, &notify);
+                    }
+                }
+                Some(s) if s.starts_with("replaceall=") => {
+                    let notify = self.notify.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active)
+                        && let Some((find, with)) = s["replaceall=".len()..].split_once(':')
+                    {
+                        tab.search.open_replace();
+                        tab.search.query = find.to_string();
+                        tab.search.with = with.to_string();
+                        self.messages
+                            .extend(crate::search_ui::replace_all(tab, &notify));
+                    }
+                }
+                Some(s) if s.starts_with("sort=") => {
+                    if let Some(tab) = self.tabs.get_mut(self.active)
+                        && let Some((col, dir)) = s["sort=".len()..].split_once(':')
+                    {
+                        let col = col.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                        crate::sort_ui::request(tab, col, dir == "desc");
+                    }
+                }
                 Some(s) if s.starts_with("filter=") => {
                     let notify = self.notify.clone();
                     if let Some(tab) = self.tabs.get_mut(self.active)
@@ -1226,9 +1447,14 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+G", "Go to row"),
     ("Ctrl+Shift+G", "Go to byte offset"),
     ("Ctrl+F", "Find"),
+    ("Ctrl+H", "Replace"),
     ("F3 / Shift+F3", "Next / previous match"),
     ("Ctrl+Shift+L", "Filter bar"),
     ("F8", "Next ragged row"),
+    ("Ctrl+E", "Export / convert"),
+    ("Ctrl+S / Ctrl+Shift+S", "Save / Save as"),
+    ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
+    ("Right-click a header", "Sort, filter, column operations"),
     ("Arrows", "Move the cursor (Shift extends the selection)"),
     ("PgUp / PgDn", "Page up / down"),
     ("Home / End", "First / last column"),
@@ -1298,11 +1524,32 @@ impl eframe::App for KatakApp {
                 .show(ui, |ui| self.banner(ui));
         }
         let notify = self.notify.clone();
+        let budget = self.settings.sort_budget();
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            // The sort first: on a reload it must forget its rows before
+            // the filter is cleared (which would ask for a re-sort).
+            self.messages
+                .extend(crate::sort_ui::tick(tab, budget, &notify));
+            match crate::search_ui::poll_replace(tab) {
+                Some(ReplaceOutcome::Message(m)) => self.messages.push(m),
+                Some(ReplaceOutcome::TooMany { matcher, with }) => {
+                    self.confirm = Some(Confirm::Rewrite {
+                        tab: i,
+                        matcher,
+                        with,
+                        backup: true,
+                    })
+                }
+                None => {}
+            }
+        }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             crate::search_ui::tick(tab, &notify);
             crate::filter_ui::tick(tab);
             if tab.search.open {
-                egui::Panel::top("search").show(ui, |ui| crate::search_ui::bar(ui, tab, &notify));
+                let messages = &mut self.messages;
+                egui::Panel::top("search")
+                    .show(ui, |ui| crate::search_ui::bar(ui, tab, &notify, messages));
             }
             if tab.filter.open {
                 let columns = tab.info.columns;
@@ -1370,6 +1617,12 @@ impl eframe::App for KatakApp {
                 if let Some(c) = info.filter_column {
                     tab.filter.add_column(c);
                 }
+                if let Some((c, descending)) = info.sort {
+                    crate::sort_ui::request(tab, c, descending);
+                }
+                if info.clear_sort {
+                    crate::sort_ui::clear(tab);
+                }
                 tab.info = info;
             } else {
                 self.welcome(ui);
@@ -1401,6 +1654,7 @@ impl eframe::App for KatakApp {
         }
         self.perf.end_frame();
         if self.perf.done {
+            self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         self.screenshot_step(&ctx);

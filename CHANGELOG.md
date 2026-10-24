@@ -4,6 +4,69 @@ All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-10-24 — Milestone 4: replace, sort, export
+
+### Added
+
+- Replace (Ctrl+H): replace in the cursor's cell and go to the next match,
+  or Replace all with regex capture groups (`$1`, `${name}`, `$$`).
+  Planned in the background with progress and cancel; up to 50,000 cells
+  become one undoable edit, above that a streaming rewrite of the file is
+  offered (only records with a match are re-assembled, the rest is copied
+  byte for byte; `.bak` by default; edits must be saved first).
+- Sort by a column from the header menu: numbers (`.`/`,` decimals),
+  dates or text by the column type, ascending or descending, unparsable
+  values last, ties in file order. Runs in the background and is shown as
+  a permutation view with a header marker and a status-bar label; a
+  filtered view sorts its rows and re-sorts when the filter changes.
+  Memory budget 32 bytes per row (default 512 MB, View → Sort memory
+  budget), checked before and enforced during the sort.
+- Export / convert (Ctrl+E) and "Save sorted as…": all rows, the rows in
+  view (filter and/or sort order) or the selection (optionally its
+  columns only); delimiter, quote character, minimal/always quoting,
+  doubled/backslash escapes, encoding with optional BOM, LF/CRLF/CR, header
+  row; edits applied; atomic write; optional "open the result".
+- `katak-bench --convert [--sort-budget MB]`; `--show export`,
+  `replace=…`, `replaceall=…`, `sort=…` for screenshots.
+
+### Decisions
+
+- Sort entries are `(8-byte key, fingerprint, offset, record)`. Text
+  compares by its first 8 bytes; equal prefixes are grouped by a 64-bit
+  fingerprint of the whole value and one value per group is re-read, so a
+  low-cardinality column costs a few reads instead of one per row. Two
+  different values with the same prefix *and* fingerprint (≈2⁻⁶⁴) would
+  be treated as equal.
+- The file is never reordered in place; the sort order is written by
+  Export (or "Save sorted as…"), which reads a dense permutation with one
+  sequential pass into rank buckets (temporary files next to the output)
+  instead of random reads.
+- Inserted rows are not part of filtered or sorted views (they are part of
+  "all rows" and selection exports).
+- Document generations are unique across documents, so a filter or sort
+  can never outlive a Save As that re-opened the file.
+- Exporting onto a file that is open in Katak is refused.
+
+### Measured (Core Ultra 9 285, Windows 11, cached files)
+
+- Sort, 1 GB / 12 M rows: numbers 1.19 s, dates 1.95 s, text with few
+  distinct values 1.59 s, all-distinct text 3.8–4.1 s; peak private
+  memory 414 MB (384 MB of entries).
+- Sort, 10 GB / 119 M rows: refused at the 512 MB default (the message
+  names the 3.5 GB needed); with an 8 GB budget numbers take 14.1 s,
+  dates 22.8 s, few-valued text 15.1 s, all-distinct text 44.4 s, peak
+  3.6 GB.
+- Export to TSV + CRLF: 1 GB at 355–362 MB/s, 10 GB at 356–400 MB/s with
+  53 MB peak private memory. In sort order: 1 GB in 7.0 s, 10 GB in 72 s
+  (one sequential pass plus 80 buckets; 16 bytes per row while running).
+- UI time per frame in a sorted 12 M-row view (scrolling, scrollbar,
+  jumps): max 3.7 ms.
+- Replace all, streaming rewrite of ~10% of the rows: 1 GB at
+  372–432 MB/s, 10 GB at 349–399 MB/s with 58–62 MB peak private memory;
+  planning (rare value, full scan of 1 GB) 1.07–1.24 GB/s.
+- Replace all under the threshold in the app: 2,041 cells applied and
+  undoable; above it the rewrite dialog appears.
+
 ## [0.3.0] — 2026-10-24 — Milestone 3: editing and saving
 
 ### Added

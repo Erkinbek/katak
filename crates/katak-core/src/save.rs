@@ -28,6 +28,7 @@ use crate::visit::visit_records;
 use crate::write::{QuotePolicy, Writer};
 
 const COPY_CHUNK: usize = 8 << 20;
+const SMALL_COPY: u64 = 1 << 20;
 
 /// Everything needed to write a document.
 #[derive(Clone)]
@@ -96,6 +97,15 @@ fn cancelled() -> io::Error {
 impl<W: Write> Saver<'_, W> {
     /// Copies source bytes `[a, b)` verbatim.
     fn copy(&mut self, a: u64, b: u64) -> io::Result<()> {
+        // Short gaps (between rewritten records) come from the mapped
+        // views: one system call each would dominate.
+        if b > a && b - a <= SMALL_COPY && self.input.src.is_mapped() {
+            let bytes = self.input.src.bytes(a, (b - a) as usize)?;
+            self.out.put(&bytes)?;
+            self.ctl.set_done(b);
+            self.ctl.notify();
+            return Ok(());
+        }
         let mut pos = a;
         let mut chunk = vec![0u8; COPY_CHUNK.min((b.saturating_sub(a)) as usize)];
         while pos < b {
@@ -440,6 +450,117 @@ pub fn write_document<W: Write>(input: &SaveInput, out: W, ctl: &JobCtl) -> io::
     Ok(s.report)
 }
 
+/// Writes the source with every match of `matcher` replaced by `with`,
+/// for a Replace All too large to keep as undoable edits. Only records
+/// with a match are re-assembled; everything else is copied verbatim.
+/// The overlay must be empty (save edits first).
+pub fn write_replaced<W: Write>(
+    input: &SaveInput,
+    matcher: &crate::search::Matcher,
+    with: &str,
+    out: W,
+    ctl: &JobCtl,
+) -> io::Result<SaveReport> {
+    let mut lf = Vec::new();
+    let mut cr = Vec::new();
+    input.dialect.encoding.encode("\n", &mut lf);
+    input.dialect.encoding.encode("\r", &mut cr);
+    let mut s = Saver {
+        input,
+        ctl,
+        out: Out {
+            w: out,
+            tail: Vec::new(),
+            written: 0,
+        },
+        w: Writer::new(&input.dialect, input.line_ending, QuotePolicy::Minimal),
+        buf: Vec::new(),
+        lf,
+        cr,
+        report: SaveReport::default(),
+    };
+    let header_records = input.dialect.has_header as u64;
+    let pre = matcher.prefilter(input.dialect.encoding);
+    let mut pos = 0u64;
+    let mut err: Option<io::Error> = None;
+    let res = visit_records(
+        &input.src,
+        &input.compiled,
+        input.data_start,
+        0,
+        ctl,
+        pre.as_ref(),
+        &[],
+        |v| {
+            if v.record < header_records || v.clipped {
+                return crate::scan::Flow::Continue;
+            }
+            let fields = split_all(&input.compiled, v.content);
+            let mut changed: Vec<Option<String>> = vec![None; fields.len()];
+            let mut any = false;
+            for (i, f) in fields.iter().enumerate() {
+                if !matcher.wants_column(i) {
+                    continue;
+                }
+                let raw =
+                    crate::fields::unquote(&input.compiled, &v.content[f.start..f.end], f.quoted);
+                let text = input.dialect.encoding.decode(&raw);
+                if matcher.is_match(&text) {
+                    let new = matcher.replace(&text, with, true);
+                    if new != text {
+                        changed[i] = Some(new.into_owned());
+                        any = true;
+                    }
+                }
+            }
+            if !any {
+                return crate::scan::Flow::Continue;
+            }
+            let r = v.span;
+            let step = (|| -> io::Result<()> {
+                s.copy(pos, r.start)?;
+                let mut b = std::mem::take(&mut s.buf);
+                b.clear();
+                b.extend_from_slice(&v.content[..fields[0].start]);
+                for (i, f) in fields.iter().enumerate() {
+                    if i > 0 {
+                        b.extend_from_slice(&v.content[fields[i - 1].end..f.start]);
+                    }
+                    match &changed[i] {
+                        Some(val) => s.w.value(val, i == 0, &mut b),
+                        None => b.extend_from_slice(&v.content[f.start..f.end]),
+                    }
+                }
+                b.extend_from_slice(&v.content[fields[fields.len() - 1].end..]);
+                s.out.put(&b)?;
+                s.buf = b;
+                s.report.records_rewritten += 1;
+                pos = r.content_end;
+                Ok(())
+            })();
+            match step {
+                Ok(()) => crate::scan::Flow::Continue,
+                Err(e) => {
+                    err = Some(e);
+                    crate::scan::Flow::Stop
+                }
+            }
+        },
+    );
+    if let Some(e) = err {
+        return Err(e);
+    }
+    if !res?.completed {
+        return Err(cancelled());
+    }
+    s.copy(pos, input.src.len())?;
+    s.out.w.flush()?;
+    s.report.bytes_written = s.out.written;
+    s.report.unmappable = s.w.unmappable;
+    s.report.used_fallback_quote = s.w.used_fallback_quote;
+    Ok(s.report)
+}
+
 /// A save failure with a message for the user. The target is unchanged.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -477,6 +598,20 @@ pub fn save_file(
     backup: bool,
     ctl: &JobCtl,
 ) -> Result<SaveReport, SaveError> {
+    save_with(target, backup, ctl, |w| write_document(input, w, ctl))
+}
+
+/// The temp-file / fsync / backup / atomic-rename procedure around any
+/// writer (save, streaming replace, export).
+pub fn save_with<F>(
+    target: &Path,
+    backup: bool,
+    ctl: &JobCtl,
+    write: F,
+) -> Result<SaveReport, SaveError>
+where
+    F: FnOnce(&mut BufWriter<&mut fs::File>) -> io::Result<SaveReport>,
+{
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -492,8 +627,14 @@ pub fn save_file(
         .map_err(|e| SaveError::new("Cannot create a temporary file next to the target", e))?;
     let report = {
         let file = tmp.as_file_mut();
-        let w = BufWriter::with_capacity(8 << 20, file);
-        write_document(input, w, ctl).map_err(|e| SaveError::new("Writing failed", e))?
+        let mut w = BufWriter::with_capacity(8 << 20, file);
+        let mut report = write(&mut w).map_err(|e| SaveError::new("Writing failed", e))?;
+        w.flush().map_err(|e| SaveError::new("Writing failed", e))?;
+        drop(w);
+        if let Ok(m) = tmp.as_file().metadata() {
+            report.bytes_written = m.len();
+        }
+        report
     };
     tmp.as_file()
         .sync_all()

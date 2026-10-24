@@ -90,6 +90,18 @@ impl Matcher {
             .collect()
     }
 
+    /// `cell` with its matches replaced by `with`. In regex mode `$1` and
+    /// `${name}` expand to capture groups; otherwise `with` is literal.
+    /// Empty matches are handled the regex way (no infinite loop).
+    pub fn replace<'a>(&self, cell: &'a str, with: &str, all: bool) -> Cow<'a, str> {
+        match (self.opts.regex, all) {
+            (true, true) => self.re.replace_all(cell, with),
+            (true, false) => self.re.replace(cell, with),
+            (false, true) => self.re.replace_all(cell, regex::NoExpand(with)),
+            (false, false) => self.re.replace(cell, regex::NoExpand(with)),
+        }
+    }
+
     /// Is column `c` searched?
     pub fn wants_column(&self, c: usize) -> bool {
         self.opts
@@ -230,6 +242,44 @@ impl Target {
     /// Is the record at `offset` deleted?
     pub(crate) fn deleted(&self, offset: u64) -> bool {
         self.overlay.as_ref().is_some_and(|o| o.is_deleted(offset))
+    }
+
+    /// Fields of a record [`Target::value`] needs to see column `col`.
+    pub(crate) fn fields_for(&self, col: usize) -> usize {
+        match self.overlay.as_ref().and_then(|o| o.columns()) {
+            Some(_) => usize::MAX,
+            None => col + 1,
+        }
+    }
+
+    /// The value of logical column `col` of a record, with edits applied.
+    /// `spans` must hold the first [`Target::fields_for`] fields.
+    pub(crate) fn value<'a>(
+        &self,
+        offset: u64,
+        content: &'a [u8],
+        spans: &[FieldSpan],
+        col: usize,
+    ) -> Cow<'a, str> {
+        let raw = |i: usize| -> Cow<'a, str> {
+            match spans.get(i) {
+                Some(f) => match unquote(&self.dialect, &content[f.start..f.end], f.quoted) {
+                    Cow::Borrowed(b) => self.encoding.decode(b),
+                    Cow::Owned(v) => Cow::Owned(self.encoding.decode(&v).into_owned()),
+                },
+                None => Cow::Borrowed(""),
+            }
+        };
+        let ov = match &self.overlay {
+            Some(ov) if ov.row_edits(offset).is_some() || ov.columns().is_some() => ov,
+            _ => return raw(col),
+        };
+        let cref = ov.col_ref(col);
+        match (ov.cell(RowRef::Src(offset), cref), cref) {
+            (Some(e), _) => Cow::Owned(e.to_string()),
+            (None, ColRef::Src(i)) => raw(i as usize),
+            (None, ColRef::New(_)) => Cow::Borrowed(""),
+        }
     }
 
     /// The values of a record in logical column order, with edits applied.

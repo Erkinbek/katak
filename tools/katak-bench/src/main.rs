@@ -2,13 +2,16 @@
 //!
 //! ```text
 //! cargo run --release -p katak-bench -- FILE... [--buffered] [--repeat N]
+//!     [--suite] [--save] [--convert]
 //! ```
 //!
 //! For each file: open + first screen (detection, first 60 rows x 40
 //! columns decoded), background indexing throughput, random jumps into the
-//! indexed region, and private memory.
+//! indexed region, and private memory. `--suite` adds search and filter,
+//! `--save` saving, `--convert` sorting, export and Replace All (the
+//! patterns suit the generated big_*.csv).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use katak_core::document::{Document, OpenOptions};
@@ -26,6 +29,10 @@ struct Args {
     suite: bool,
     /// Measure saving (zero edits and a handful of edits) to a temp file.
     save: bool,
+    /// Measure sorting, export and Replace All.
+    convert: bool,
+    /// Sort memory budget in MB (`--sort-budget`).
+    sort_budget_mb: u64,
 }
 
 fn parse_args() -> Args {
@@ -35,6 +42,8 @@ fn parse_args() -> Args {
         repeat: 1,
         suite: false,
         save: false,
+        convert: false,
+        sort_budget_mb: katak_core::sort::DEFAULT_BUDGET >> 20,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -43,11 +52,20 @@ fn parse_args() -> Args {
             "--repeat" => args.repeat = it.next().and_then(|n| n.parse().ok()).unwrap_or(1),
             "--suite" => args.suite = true,
             "--save" => args.save = true,
+            "--convert" => args.convert = true,
+            "--sort-budget" => {
+                args.sort_budget_mb = it
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(args.sort_budget_mb)
+            }
             _ => args.files.push(PathBuf::from(a)),
         }
     }
     if args.files.is_empty() {
-        eprintln!("usage: katak-bench FILE... [--buffered] [--repeat N] [--suite] [--save]");
+        eprintln!(
+            "usage: katak-bench FILE... [--buffered] [--repeat N] [--suite] [--save] [--convert] [--sort-budget MB]"
+        );
         std::process::exit(2);
     }
     args
@@ -70,8 +88,7 @@ fn mem() -> String {
 fn bench(
     path: &PathBuf,
     access: AccessMode,
-    suite: bool,
-    save: bool,
+    args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let len = std::fs::metadata(path)?.len();
     println!("\n== {} ({})", path.display(), human_bytes(len));
@@ -161,12 +178,165 @@ fn bench(
         ms(worst)
     );
     println!("   private memory with file open and indexed: {}", mem());
-    if suite {
+    if args.suite {
         search_suite(&mut doc)?;
     }
-    if save {
+    if args.save {
         save_bench(&mut doc, path)?;
     }
+    if args.convert {
+        convert_bench(&mut doc, path, args.sort_budget_mb << 20)?;
+    }
+    Ok(())
+}
+
+/// Runs `f` as a job, sampling private memory; returns (time, peak).
+fn timed_job(
+    f: impl FnOnce(&katak_core::job::JobCtl) -> Result<(), String> + Send + 'static,
+) -> Result<(Duration, u64), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let job = katak_core::job::Job::spawn("bench", no_notify(), f);
+    let mut peak = private_bytes().unwrap_or(0);
+    while job.is_running() {
+        std::thread::sleep(Duration::from_millis(20));
+        peak = peak.max(private_bytes().unwrap_or(0));
+    }
+    job.join();
+    if let Some(e) = job.error() {
+        return Err(e.into());
+    }
+    Ok((start.elapsed(), peak))
+}
+
+/// Sorting, export and Replace All on the big_*.csv layout
+/// (id,name,email,amount,date,city,notes).
+fn convert_bench(
+    doc: &mut Document,
+    path: &Path,
+    budget: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use katak_core::export::{self, ExportInput, ExportOptions, Scope};
+    use katak_core::sort::{self, SortKey, SortSpec};
+    let len = doc.source().len();
+    let rows = doc.stats().rows;
+    let mut sorted = None;
+    for (name, col, key) in [
+        ("amount (numbers)", 3, SortKey::Number),
+        ("date (dates)", 4, SortKey::Date),
+        ("city (text, few distinct values)", 5, SortKey::Text),
+        ("email (text, all distinct)", 2, SortKey::Text),
+    ] {
+        let spec = SortSpec {
+            col,
+            key,
+            descending: false,
+        };
+        let t = Instant::now();
+        let run = match sort::start(doc.target(), spec, None, budget, rows, no_notify()) {
+            Ok(run) => run,
+            Err(e) => {
+                println!("   sort by {name}: refused: {e}");
+                break;
+            }
+        };
+        let mut peak = private_bytes().unwrap_or(0);
+        while run.job.is_running() {
+            std::thread::sleep(Duration::from_millis(20));
+            peak = peak.max(private_bytes().unwrap_or(0));
+        }
+        run.job.join();
+        let took = t.elapsed();
+        let n = run.data.lock().rows.len();
+        println!(
+            "   sort by {name}: {n} rows in {:.0} ms = {:.0} MB/s, peak private memory {}",
+            ms(took),
+            mb_per_s(len, took),
+            human_bytes(peak)
+        );
+        if col == 3 {
+            sorted = Some(run.data.clone());
+        }
+    }
+    let out = path.with_extension("katak-bench-export.tmp.tsv");
+    let tsv = ExportOptions {
+        dialect: katak_core::dialect::Dialect {
+            delimiter: katak_core::dialect::Delimiter::Char('\t'),
+            ..katak_core::dialect::Dialect::default()
+        },
+        policy: katak_core::write::QuotePolicy::Minimal,
+        line_ending: katak_core::scan::Term::CrLf,
+        bom: false,
+        columns: None,
+    };
+    let mut scopes: Vec<(&str, Scope)> = vec![("whole file to TSV + CRLF", Scope::All)];
+    if let Some(l) = sorted {
+        scopes.push(("in sort order to TSV", Scope::List(l)));
+    }
+    for (name, scope) in scopes {
+        let input = ExportInput {
+            target: doc.target(),
+            locator: doc.job_locator(),
+            overlay: doc.overlay.snapshot(),
+            header: doc.header_record()?.map(|h| h.start),
+            columns: 7,
+            rows,
+        };
+        let (o, opts) = (out.clone(), tsv.clone());
+        let (took, peak) = timed_job(move |ctl| {
+            export::export(input, scope, &opts, &o, ctl)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })?;
+        println!(
+            "   export {name}: {} in {:.0} ms = {:.0} MB/s of input, peak private memory {}",
+            human_bytes(std::fs::metadata(&out)?.len()),
+            ms(took),
+            mb_per_s(len, took),
+            human_bytes(peak)
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+    // Replace All: a rare value (planned as undoable edits, full scan) and a
+    // common one (streaming rewrite of the whole file).
+    let opts = |p: &str| SearchOptions {
+        pattern: p.into(),
+        case_sensitive: true,
+        ..SearchOptions::default()
+    };
+    let t = Instant::now();
+    let plan = katak_core::replace::plan(
+        doc.target(),
+        opts("foxtrot foxtrot 7"),
+        "FF7".into(),
+        katak_core::replace::DEFAULT_THRESHOLD,
+        no_notify(),
+    )?;
+    plan.job.join();
+    let took = t.elapsed();
+    println!(
+        "   replace-all plan, rare value: {} cells in {:.0} ms = {:.0} MB/s",
+        plan.data.lock().edits.len(),
+        ms(took),
+        mb_per_s(len, took)
+    );
+    let matcher = katak_core::search::Matcher::new(&opts("Samarkand"))?;
+    let input = doc.save_input(7);
+    let o = out.clone();
+    let (took, peak) = timed_job(move |ctl| {
+        katak_core::save::save_with(&o, false, ctl, |w| {
+            katak_core::save::write_replaced(&input, &matcher, "Samarqand", w, ctl)
+        })
+        .map(|r| println!("   (rewrote {} records)", r.records_rewritten))
+        .map_err(|e| e.to_string())
+    })?;
+    println!(
+        "   replace-all rewrite, ~10% of rows: {} in {:.0} ms = {:.0} MB/s, peak private memory {}",
+        human_bytes(std::fs::metadata(&out)?.len()),
+        ms(took),
+        mb_per_s(len, took),
+        human_bytes(peak)
+    );
+    let _ = std::fs::remove_file(&out);
     Ok(())
 }
 
@@ -381,7 +551,7 @@ fn main() {
     let args = parse_args();
     for _ in 0..args.repeat {
         for f in &args.files {
-            if let Err(e) = bench(f, args.access, args.suite, args.save) {
+            if let Err(e) = bench(f, args.access, &args) {
                 eprintln!("{}: {e}", f.display());
             }
         }

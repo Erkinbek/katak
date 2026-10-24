@@ -41,6 +41,22 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
             );
             ui.label(RichText::new(text).strong());
         }
+        if let Some(s) = &tab.sort {
+            sep(ui);
+            if s.run.job.is_running() {
+                ui.add(
+                    egui::ProgressBar::new(s.run.job.fraction())
+                        .desired_width(110.0)
+                        .text(format!("Sorting {:.0}%", s.run.job.fraction() * 100.0)),
+                );
+            } else {
+                ui.label(RichText::new(s.describe()).strong())
+                    .on_hover_text("Right-click a column header to change or clear the sort. Export writes the rows in this order.");
+            }
+        } else if tab.sort_pending.is_some() {
+            sep(ui);
+            ui.label("Sorting after the filter finishes…");
+        }
         sep(ui);
         let col = tab.info.cursor_col;
         match column_name {
@@ -111,11 +127,11 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(s) = &tab.save {
+            for s in [&tab.save, &tab.export].into_iter().flatten() {
                 ui.add(
                     egui::ProgressBar::new(s.job.fraction())
                         .desired_width(120.0)
-                        .text(format!("Saving {:.0}%", s.job.fraction() * 100.0)),
+                        .text(format!("{} {:.0}%", s.kind.verb(), s.job.fraction() * 100.0)),
                 );
             }
             if stats.indexing {

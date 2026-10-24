@@ -150,6 +150,7 @@ fn apply(tab: &mut Tab, notify: &Notify) {
         clear(tab);
         return;
     }
+    crate::sort_ui::refilter(tab);
     match filter::start(
         tab.doc.target(),
         filters,
@@ -179,6 +180,7 @@ pub fn apply_quick(tab: &mut Tab, notify: &Notify, col: usize, text: &str) {
 
 /// Removes the filter and shows every row again.
 pub fn clear(tab: &mut Tab) {
+    crate::sort_ui::refilter(tab);
     tab.filter.run = None;
     tab.filter.error = None;
     tab.grid.set_view(View::Natural);
