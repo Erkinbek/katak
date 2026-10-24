@@ -73,6 +73,15 @@ the scripted UI self-test used to measure frame times).
   on Windows, for remote or removable drives (`GetDriveTypeW`): a page fault on
   a mapping whose backing store disappears is an access violation, a failed
   `read` is just an error we can show.
+* **Non-blocking reads**: a thread can ask for them (the UI thread does).
+  There, a block of a buffered source that is not cached is queued for the
+  source's background reader (plus one block of read-ahead) and the read
+  fails at once with `WouldBlock`; the reader puts the block into the cache
+  and calls the document's notify, which repaints. The grid keeps the
+  previous rows meanwhile and retries jumps; after a failed read the error
+  is shown for 3 s instead of queueing the same read again. Opening and
+  re-parsing read their first bytes directly, and the 1 MB detection sample
+  primes the first block. Jobs always read blocking.
 
 Sequential consumers (indexer, search, filter, sort, save) use `ChunkReader`,
 a `fill`/`consume` reader that refills a reusable buffer with positional
@@ -84,8 +93,12 @@ therefore handled by the same code in every mode. UI-side reads use
 `ChunkReader::cached`, which borrows mapped views or the block cache.
 
 The source length is fixed at open time. Bytes appended later by another
-process are ignored until the user reloads (external changes are detected by
-polling size/mtime on a watcher thread).
+process are ignored until the user reloads: a watcher thread looks at the
+size and modification time of every open file every 2 s (never on the UI
+thread, a network drive may take long to answer) and the app shows a
+"changed on disk" banner with Reload / Keep this version; a deleted or moved
+file is reported too. Katak's own saves re-open the file and do not trigger
+it.
 
 ## 4. Dialect and code units
 
@@ -107,6 +120,11 @@ All structural characters are encoded into the file's *code units* once
 (`CompiledDialect`). The scanners are generic over `Units`: `U8` (UTF-8 and
 ASCII-compatible code pages; hot loops use `memchr`) and `U16Le`/`U16Be`
 (simple unit loops). Rows and fields are always byte ranges into the source.
+
+`Delimiter::Lines` has no separator, so every record is one value; with no
+quote character every line is a record. The raw-text view is built on it,
+so indexing, search, filter, editing and saving need no special case. An
+empty delimiter never matches in the scanner or the splitter.
 
 ## 5. Quote-aware row scanning (`scan`)
 

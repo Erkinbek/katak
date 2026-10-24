@@ -1,5 +1,5 @@
 ; Inno Setup script for the optional Katak installer.
-; Build: ISCC.exe /DAppVersion=0.4.0 /DSourceExe=path\to\katak.exe katak.iss
+; Build: ISCC.exe /DAppVersion=0.5.0 /DSourceExe=path\to\katak.exe katak.iss
 ; The portable katak.exe works without installing; the installer only adds
 ; a Start menu entry, an uninstaller and "Open with" registration.
 
