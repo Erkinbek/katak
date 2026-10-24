@@ -9,11 +9,13 @@ pub mod encoding;
 pub mod fields;
 pub mod index;
 pub mod job;
+pub mod locate;
 pub mod scan;
 pub mod source;
 pub mod units;
 
 pub use dialect::{Compiled, Delimiter, Dialect, DialectError, Escape};
 pub use encoding::TextEncoding;
+pub use locate::{Locator, RowPos};
 pub use scan::{RecSpan, Term};
 pub use source::{AccessMode, Source};
