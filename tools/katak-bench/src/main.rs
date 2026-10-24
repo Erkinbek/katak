@@ -225,7 +225,7 @@ fn search_suite(doc: &mut Document) -> Result<(), Box<dyn std::error::Error>> {
             d.hits.len(),
             if d.capped { " (capped)" } else { "" },
             ms(took),
-            mb_per_s(if d.done { len } else { done }, took)
+            mb_per_s(if d.capped || !d.done { done } else { len }, took)
         );
     }
     let f = |col: usize, op: FilterOp| ColumnFilter {
