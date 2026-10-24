@@ -1,199 +1,193 @@
-# Katak
+<p align="center">
+  <img src="docs/images/logo.svg" width="88" height="88" alt="Katak logo">
+</p>
 
-**Katak** (Uzbek for "cell") is a desktop viewer/editor for huge delimited
-text files — CSV, TSV or any custom delimiter — of 1 GB, 10 GB, 50 GB and
-more. Files open instantly and the window never freezes: the file is
-memory-mapped, never read into RAM, and everything proportional to the file
-size runs in the background.
+<h1 align="center">Katak — fast viewer and editor for huge CSV files</h1>
 
-* Windows 11 x64 (primary), Linux x64, macOS (arm64 and x64).
-* One self-contained binary, no runtime dependencies.
-* Written in Rust with [egui](https://github.com/emilk/egui); a custom
-  virtualized grid over a sparse, quote-aware index of the memory map.
+<p align="center">
+  <b>Open 1 GB, 10 GB or 50 GB CSV and TSV files instantly. Search, filter, sort, edit and convert them without loading the file into memory.</b><br>
+  Free and open source · Windows, macOS and Linux · one small native binary, written in Rust
+</p>
 
-The design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+<p align="center">
+  <a href="https://github.com/Erkinbek/katak/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Erkinbek/katak?label=download&color=0ea5e9"></a>
+  <a href="https://github.com/Erkinbek/katak/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/Erkinbek/katak/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="Platforms: Windows, macOS, Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational">
+</p>
 
-## Status
+<p align="center">
+  <a href="#download"><b>Download</b></a> ·
+  <a href="https://erkinbek.github.io/katak/">Website</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#performance">Benchmarks</a> ·
+  <a href="#faq">FAQ</a>
+</p>
 
-| Milestone | Scope | State |
-|-----------|-------|-------|
-| 1 | open, parsing dialog, virtualized grid, scrolling, go to row/offset | **done** (v0.1.0) |
-| 2 | search and filter | **done** (v0.2.0) |
-| 3 | edit overlay, undo/redo, save with byte-identical round trip | **done** (v0.3.0) |
-| 4 | find/replace, sort, export conversions | **done** (v0.4.0) |
-| 5 | encodings, raw-text mode, polish | **done** (v0.5.0) |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.webp">
+  <img src="docs/images/hero-light.webp" alt="Katak showing a 10 GB CSV file with 119 million rows, opened instantly while the file is indexed in the background">
+</picture>
 
-## Features
+<p align="center"><sub>A 10 GB CSV file with 119 million rows: on screen 0.2 s after launch, while the rest of the file is indexed in the background at 1.6 GB/s.</sub></p>
 
-* Opens files of any size in milliseconds: only the first 1 MB is read to
-  detect the format and show the first screen; indexing continues in the
-  background with a progress bar. Until it finishes, row counts are shown
-  as estimates (`~12,400,000`) and jumps into the un-indexed part are
-  resynchronized heuristically and marked approximate.
-* Auto-detection of delimiter, quote character, escape style, header row,
-  encoding (BOM, UTF-8, UTF-16 LE/BE, legacy code pages via chardetng),
-  line endings and Excel's `sep=;` line.
-* Parsing options dialog with a live preview of the first 50 rows:
-  comma, semicolon, tab, space, colon, pipe, any custom (multi-character)
-  delimiter, "treat consecutive delimiters as one", a whitespace preset,
-  quote `"` / `'` / none, doubled or backslash escapes, header yes/no,
-  skip first N lines, comment prefix, trim (off by default), encoding.
-* Quoted fields may contain delimiters, quotes and line breaks (LF, CR,
-  CRLF); quotes are only special at the start of a field.
-* Virtualized grid: only visible rows *and* columns are parsed and drawn,
-  so files with 10,000 or 1,000,000 columns scroll smoothly. Frozen header,
-  optional frozen columns, row numbers, resizable and auto-sized columns,
-  numbers right-aligned (column types are inferred from a sample and never
-  change the displayed text), hover tooltips, double-click to open a whole
-  cell (the first 256 KB of a huge cell).
-* Ragged rows are highlighted and counted; F8 jumps to the next one.
-* Unterminated quotes are detected and reported with their byte offset,
-  with a one-click "parse with quote = none".
-* Go to row (Ctrl+G) or byte offset (Ctrl+Shift+G); the vertical scrollbar
-  is byte-offset based and works before indexing completes.
-* Tabs, drag and drop, command-line arguments (`katak data.csv`, which
-  also makes Windows "Open with" work), light/dark theme, zoom, font size,
-  monospace font.
-* Network and removable drives are read with buffered I/O instead of a
-  memory map, so a disconnected share produces an error, not a crash — and
-  in the background: the window never waits for a slow share; rows still
-  loading keep the previous picture until they arrive.
-* **Raw text**: the parsing dialog shows the file's characters as they are
-  (tabs, line breaks and control characters as escapes, delimiter and quote
-  colored), and "None: one value per line" opens the file as raw lines —
-  searchable, filterable, editable and saved byte for byte like any other
-  view.
-* **Encodings**: auto-detected, changeable in the parsing dialog or with
-  File → Reopen with encoding (UTF-8, UTF-16 LE/BE, Windows code pages,
-  ISO-8859-x, KOI8, Shift_JIS, EUC, GBK/GB18030, Big5, …); saving keeps
-  the file's encoding, Export converts.
-* **Changes on disk**: if another program changes, appends to or deletes an
-  open file, a banner offers to reload it (Katak keeps showing the version
-  it opened until then).
-* Text in any script: system fonts are added as fallbacks for CJK, Hangul,
-  Indic scripts and symbols.
-* The status bar summarizes a selection: size, filled cells and sum /
-  average / min / max of its numbers.
-* **Search** (Ctrl+F): plain text or regex, match case (with Unicode case
-  folding), whole word, whole cell, current column only. Runs in the
-  background with a live counter; F3 / Shift+F3 work before it finishes;
-  a virtualized results panel (row, column, highlighted preview); matches
-  are highlighted in the visible cells. Results are capped at 1,000,000
-  with a "more exist" indicator. Non-UTF-8 files (UTF-16, code pages) are
-  searched too.
-* **Filter** (Ctrl+Shift+L, or "Filter this column" in the header menu):
-  contains / equals / starts with / regex / empty / not empty / numeric
-  range per column, combined with AND. The grid shows the matching rows
-  (with their original row numbers) while the filter is still running,
-  with an "N of M rows match" counter; up to 4,000,000 rows are listed.
-* **Editing**: double-click, F2 or just start typing; Enter / Tab / arrows
-  commit and move, Esc cancels. Large or multi-line values open an editable
-  cell viewer. Copy / cut / paste as TSV (Excel-compatible; paste fills a
-  rectangle), Delete clears, Ctrl+D fills down. Insert rows above/below,
-  delete rows, insert / rename / move / delete columns. Undo/redo for
-  everything. Edited cells are marked and inserted rows numbered in green
-  until saved; "Discard all edits" and a read-only mode are in the Edit menu.
-* Edits are an **overlay** over the unchanged file: nothing is copied, and
-  search and filter see the unsaved values.
-* **Saving** (Ctrl+S) streams the file through the overlay into a temp file
-  next to it, fsyncs it and atomically replaces the original; untouched
-  rows are copied byte for byte (a save without edits is byte-identical),
-  edited rows keep their original delimiter, quoting of unchanged fields
-  and line ending. Optional `.bak` copy; Save As (Ctrl+Shift+S). A failed
-  or cancelled save never touches the original, and "file is open in
-  another program" / read-only / disk-full errors are explained.
-* **Replace** (Ctrl+H): replace in the current cell and move to the next
-  match, or Replace all — with regex capture groups (`$1`, `${name}`).
-  Up to 50,000 changed cells become one undoable edit; above that Katak
-  offers to rewrite the file in one streaming pass (only rows with a match
-  are rewritten, a `.bak` is kept by default).
-* **Sort** (right-click a column header): ascending or descending, as
-  numbers (`.` or `,` decimals), dates or text depending on the column
-  type; values that do not parse go last, equal values keep file order.
-  The sort runs in the background and is shown as a view — the file is not
-  reordered. A filtered view sorts only the matching rows. Memory is
-  bounded by a budget (32 bytes per row, 512 MB by default, View → Sort
-  memory budget).
-* **Export / convert** (File menu, Ctrl+E): all rows, the filtered and/or
-  sorted rows ("Save sorted as…" applies the sort order) or the selection
-  (optionally only its columns), with another delimiter, quote character,
-  quoting policy, escape style, encoding (with or without BOM) or line
-  ending. Edits are included; the export streams with bounded memory and
-  can be opened in a new tab.
+## Why Katak
 
-## Building
+Excel and LibreOffice Calc stop at 1,048,576 rows. Text editors try to read
+the whole file and freeze. Importing into a database takes minutes before
+you see a single row. Katak (Uzbek for "cell") is made for the CSV files
+that are too big for everything else:
 
-Install Rust (stable) from <https://rustup.rs>. The repository pins the
-stable channel in `rust-toolchain.toml`.
+* **Opens any size instantly.** Only the first megabyte is read to show the
+  first screen, about 0.2 s after launch even for a 50 GB file. Row counts
+  are estimated until the background index catches up.
+* **Never freezes.** Indexing, search, filter, sort, replace and save run in
+  the background with progress and cancel. The UI thread never waits for
+  the disk; measured frame times stay below 10 ms.
+* **Never loads the file into RAM.** The file is memory-mapped and only the
+  visible cells are parsed. A 50 GB file, open and fully indexed, uses
+  127 MB of memory.
+* **Edits without damage.** Changes are kept as an overlay and saved by
+  streaming into a temp file that atomically replaces the original. Rows you
+  did not touch are copied byte for byte: no re-quoting, no reformatted
+  numbers or dates, no lost leading zeros.
+* **One portable binary.** About 12 MB, no installer needed, no Java, .NET
+  or Python. Katak never connects to the internet.
 
-```sh
-git clone <repository-url> katak
-cd katak
-cargo build --release -p katak
-```
+## Download
 
-The binary is `target/release/katak` (`katak.exe` on Windows).
+| Platform | Download |
+|----------|----------|
+| Windows 10 / 11 (x64) | [Portable .exe](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.exe) · [Installer](https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64-setup.exe) |
+| macOS, Apple Silicon | [katak-macos-arm64.tar.gz](https://github.com/Erkinbek/katak/releases/latest/download/katak-macos-arm64.tar.gz) |
+| macOS, Intel | [katak-macos-x64.tar.gz](https://github.com/Erkinbek/katak/releases/latest/download/katak-macos-x64.tar.gz) |
+| Linux x64 (glibc 2.35+) | [katak-linux-x64.tar.gz](https://github.com/Erkinbek/katak/releases/latest/download/katak-linux-x64.tar.gz) |
 
-* **Windows**: use the MSVC toolchain (`x86_64-pc-windows-msvc`, the
-  default) with the "Desktop development with C++" build tools. The
-  resulting `katak.exe` is portable. The optional installer is built with
-  [Inno Setup](https://jrsoftware.org/isinfo.php):
-  `ISCC.exe /DAppVersion=0.5.0 packaging\windows\katak.iss`.
-* **Linux**: install the X11/Wayland headers egui needs, e.g. on Debian or
-  Ubuntu `sudo apt install libxcb-render0-dev libxcb-shape0-dev
-  libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev`. File dialogs use
-  the XDG desktop portal, so GTK is not needed.
-* **macOS**: Xcode command line tools. Build both architectures with
-  `--target aarch64-apple-darwin` and `--target x86_64-apple-darwin`.
+Every release, with SHA-256 checksums, is on the
+[releases page](https://github.com/Erkinbek/katak/releases). With a Rust
+toolchain you can also run
+`cargo install --git https://github.com/Erkinbek/katak --locked katak`, or
+[build from source](#building-from-source).
 
-CI (GitHub Actions) builds and tests on Windows, Linux and macOS on every
-push and pull request; pushing a `v*` tag builds release binaries for all
-platforms plus the Windows installer and attaches them to a GitHub Release.
+> The binaries are not code-signed yet. On Windows, SmartScreen may ask you
+> to confirm (More info → Run anyway). On macOS, run
+> `xattr -d com.apple.quarantine katak` once after extracting, or
+> right-click the file and choose Open.
 
-## Usage
+Then open a file with File → Open, by dropping it on the window, with
+"Open with" in Explorer (the installer registers `.csv`, `.tsv` and
+`.txt`) or from a terminal:
 
 ```sh
 katak data.csv other.tsv
 ```
 
-Or start Katak and use File → Open, or drop files on the window.
+## Features
 
-### Keyboard shortcuts
+### Opens any CSV, TSV or delimited text file
 
-| Keys | Action |
-|------|--------|
-| Ctrl+O | Open files |
-| Ctrl+W | Close tab |
-| Ctrl+Tab | Next tab |
-| Ctrl+Shift+P | Parsing options |
-| Ctrl+F | Find |
-| Ctrl+H | Replace |
-| F3 / Shift+F3 | Next / previous match |
-| Ctrl+Shift+L | Filter bar |
-| Ctrl+S / Ctrl+Shift+S | Save / Save as |
-| Ctrl+E | Export / convert |
-| Ctrl+Z / Ctrl+Y | Undo / redo |
-| F2, double-click, typing | Edit the cell |
-| Enter / Tab / Esc (editing) | Commit and move down / right, cancel |
-| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste (TSV) |
-| Delete / Ctrl+D / Ctrl+A | Clear / fill down / select all |
-| Ctrl+G | Go to row |
-| Ctrl+Shift+G | Go to byte offset |
-| F8 | Next ragged row |
-| Arrow keys | Move the cursor (Shift extends the selection) |
-| Page Up / Page Down | Page up / down |
-| Home / End | First / last column |
-| Ctrl+Home / Ctrl+End | First / last row |
-| Shift+mouse wheel | Scroll horizontally |
-| Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
-| Right-click a cell | Rows, columns, clipboard, filter |
-| Right-click a column header | Sort, filter this column, auto-fit, freeze, column type |
-| F1 | Shortcut list |
+Katak detects the delimiter, quote character, escape style, header row,
+encoding and line endings from the first megabyte, and handles Excel's
+`sep=;` line. Everything can be changed in the parsing dialog, with a live
+preview of the first 50 rows: comma, semicolon, tab, space, colon, pipe or
+any custom multi-character delimiter, "treat consecutive delimiters as
+one", whitespace-aligned files, quote `"` / `'` / none, doubled or
+backslash escapes, skipped lines, comment lines and trimming (off by
+default). A raw-text view shows the bytes as they are, and "one value per
+line" opens any text file as a list of lines.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/parse-dark.webp">
+  <img src="docs/images/parse-light.webp" alt="Parsing options dialog detecting a semicolon-separated CSV file with decimal commas, with a live preview">
+</picture>
+
+### Search and filter at gigabytes per second
+
+* **Search** (Ctrl+F): plain text or regex, match case with Unicode case
+  folding, whole word, whole cell, current column only. Results stream in
+  while the search runs (0.8–1.4 GB/s on cached files), F3 jumps to the next
+  match before it finishes, and up to 1,000,000 results are listed.
+* **Filter** (Ctrl+Shift+L): contains / equals / starts with / regex / empty /
+  not empty / numeric range per column, combined with AND. Matching rows
+  appear in the grid with their original row numbers while the filter is
+  still running.
+* Search and filter see your unsaved edits, and work on UTF-16 and legacy
+  code-page files too.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/search-dark.webp">
+  <img src="docs/images/search-light.webp" alt="Searching a 10 GB CSV file: over a million matches listed while indexing continues">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/filter-dark.webp">
+  <img src="docs/images/filter-light.webp" alt="Filtering a 10 GB CSV file by city: 1.5 million matching rows shown while the filter runs">
+</picture>
+
+### Sorts millions of rows
+
+Right-click a column header to sort as numbers, dates or text, ascending or
+descending. The sort runs in the background and is shown as a view; the
+file is only reordered if you export or "Save sorted as…". 12 million rows
+sort in 1.2 s within a 512 MB memory budget (configurable).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/sort-dark.webp">
+  <img src="docs/images/sort-light.webp" alt="12 million rows sorted by amount, descending">
+</picture>
+
+### Edit like a spreadsheet, save without surprises
+
+Double-click, F2 or just start typing. Copy, cut and paste as TSV
+(Excel-compatible), fill down, insert and delete rows, insert, rename, move
+and delete columns, undo and redo everything. **Find & Replace** (Ctrl+H)
+supports regex capture groups (`$1`, `${name}`); up to 50,000 changed cells
+are one undoable step, larger replacements rewrite the file in a single
+streaming pass. Saving (Ctrl+S) keeps the original delimiter, quoting,
+encoding and line endings; a save without edits is byte-identical, and an
+optional `.bak` keeps the previous version.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/edit-dark.webp">
+  <img src="docs/images/edit-light.webp" alt="Editing cells: an edited cell, an inserted row and the inline editor">
+</picture>
+
+### Converts and exports
+
+Export (Ctrl+E) all rows, the filtered or sorted rows, or a selection (with
+only its columns) to a new file with another delimiter, quoting policy,
+encoding (with or without BOM) or line ending. Exports stream with bounded
+memory: a 10 GB file converts at 350–400 MB/s using 53 MB of RAM.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/export-dark.webp">
+  <img src="docs/images/export-light.webp" alt="Export dialog: convert a CSV file to TSV, change encoding, quoting and line endings">
+</picture>
+
+### Built for awkward files
+
+* Quoted fields with delimiters, quotes and line breaks (LF, CR, CRLF) are
+  parsed correctly, also when jumping into the middle of a file.
+* Ragged rows are highlighted and counted (F8 jumps to the next one);
+  unterminated quotes are reported with their byte offset.
+* Files with 10,000 or 1,000,000 columns scroll smoothly: only the visible
+  rows *and* columns are parsed and drawn. A single 500 MB cell opens as a
+  bounded preview.
+* Encodings: UTF-8, UTF-16 LE/BE, Windows code pages, ISO-8859-x, KOI8,
+  Shift_JIS, EUC, GBK/GB18030, Big5 and more, auto-detected or chosen with
+  File → Reopen with encoding. Invalid bytes show as `�`, never a crash.
+* Network and USB drives are read in the background, so a slow or
+  disconnected share never freezes the window. If another program changes
+  or deletes the open file, Katak offers to reload it.
+* Go to any row (Ctrl+G) or byte offset (Ctrl+Shift+G), even before
+  indexing finishes. Tabs, light and dark themes, zoom, frozen columns,
+  column types for alignment and sorting (displayed text is never changed),
+  and a status bar with the sum, average, min and max of the selection.
 
 ## Performance
 
-Measured on an Intel Core Ultra 9 285 (24 cores), 191 GB RAM, Windows 11,
-files in the OS cache, release build. Files come from `tools/katak-gen`.
+Measured on an Intel Core Ultra 9 285 (24 cores), Windows 11, files in the
+OS cache, release build. Files come from `tools/katak-gen`.
 
 | Target | Goal | Measured |
 |--------|------|----------|
@@ -202,7 +196,7 @@ files in the OS cache, release build. Files come from `tools/katak-gen`.
 | Parsing-dialog preview update | < 100 ms | **0.03 ms** |
 | Background indexing, 1 GB file | ≥ 500 MB/s | **1.66–1.75 GB/s** |
 | Background indexing, 10 GB / 50 GB file | ≥ 500 MB/s | **1.56 GB/s (6.6 s) / 1.44 GB/s (35 s)** |
-| Indexing, whitespace-aligned (generic path) | ≥ 500 MB/s | **681–690 MB/s** |
+| Indexing, whitespace-aligned (generic path) | ≥ 500 MB/s | **681–764 MB/s** |
 | Indexing, UTF-16LE | ≥ 500 MB/s | **810 MB/s** |
 | Indexing, 100 million 1-character rows | ≥ 500 MB/s | **655–660 MB/s** |
 | Jump to any indexed row + render 60×40 cells | < 50 ms | **avg 0.1–0.7 ms, worst 3.1 ms** |
@@ -243,18 +237,131 @@ KATAK_TEST_READ_DELAY_MS=150 target/release/katak testdata/generated/big_10g.csv
 scrolls horizontally and jumps to random rows for a few seconds, appends
 frame-time statistics to the log and exits.
 
-## Development
+## Keyboard shortcuts
+
+| Keys | Action |
+|------|--------|
+| Ctrl+O | Open files |
+| Ctrl+W | Close tab |
+| Ctrl+Tab | Next tab |
+| Ctrl+Shift+P | Parsing options |
+| Ctrl+F | Find |
+| Ctrl+H | Replace |
+| F3 / Shift+F3 | Next / previous match |
+| Ctrl+Shift+L | Filter bar |
+| Ctrl+S / Ctrl+Shift+S | Save / Save as |
+| Ctrl+E | Export / convert |
+| Ctrl+Z / Ctrl+Y | Undo / redo |
+| F2, double-click, typing | Edit the cell |
+| Enter / Tab / Esc (editing) | Commit and move down / right, cancel |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste (TSV) |
+| Delete / Ctrl+D / Ctrl+A | Clear / fill down / select all |
+| Ctrl+G | Go to row |
+| Ctrl+Shift+G | Go to byte offset |
+| F8 | Next ragged row |
+| Arrow keys | Move the cursor (Shift extends the selection) |
+| Page Up / Page Down | Page up / down |
+| Home / End | First / last column |
+| Ctrl+Home / Ctrl+End | First / last row |
+| Shift+mouse wheel | Scroll horizontally |
+| Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
+| Right-click a cell | Rows, columns, clipboard, filter |
+| Right-click a column header | Sort, filter this column, auto-fit, freeze, column type |
+| F1 | Shortcut list |
+
+## FAQ
+
+### How do I open a CSV file that is too large for Excel?
+
+Open it in Katak (File → Open, drag and drop, or `katak file.csv`). There is
+no row limit: the first rows appear immediately and the rest of the file is
+indexed in the background. To get the data into Excel afterwards, filter it
+down or select the part you need and export it as a smaller CSV.
+
+### How large a file can Katak open?
+
+Files are memory-mapped, so the limit is your disk, not your RAM. Katak is
+tested with 50 GB files, 119 million rows, 100 million one-character rows
+and 1,000,000 columns. The index takes about 0.03 % of the file size.
+
+### Does Katak load the whole file into memory?
+
+No. Only the visible rows and columns are read and parsed. Search, filter,
+sort and save stream through the file on background threads with bounded
+memory.
+
+### Will saving change data I did not edit?
+
+No. Untouched rows are copied byte for byte, and Katak never reformats
+numbers or dates, strips leading zeros or trims whitespace. Saving writes a
+temp file next to the original, flushes it and atomically replaces the
+original, so a crash or a full disk never leaves a half-written file.
+
+### Can it open TSV, semicolon, pipe or space-aligned files?
+
+Yes: any single or multi-character delimiter, runs of spaces or tabs, and
+plain text with one value per line. Fixed-width columns are not supported
+yet.
+
+### Can I convert a huge CSV, change its delimiter or encoding, or extract part of it?
+
+Yes, with Export (Ctrl+E): all rows, the filtered rows, the sorted order or
+a selection, with another delimiter, quoting, encoding or line ending. It
+streams, so a 10 GB conversion needs about 50 MB of RAM.
+
+### Is Katak free?
+
+Yes. Katak is open source under the MIT license, with no account, no
+telemetry and no network access.
+
+### What does Katak not do yet?
+
+Search does not look into newly inserted rows, inserted rows are not part
+of filtered or sorted views, right-to-left scripts are shown without
+shaping, and there is no fixed-width mode. See the
+[issues](https://github.com/Erkinbek/katak/issues) and feel free to open
+one.
+
+## Building from source
+
+Install Rust (stable) from <https://rustup.rs>. The repository pins the
+stable channel in `rust-toolchain.toml`.
 
 ```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+git clone https://github.com/Erkinbek/katak.git
+cd katak
+cargo build --release -p katak
 ```
 
-All three must pass before every commit. Commits follow Conventional
-Commits; each milestone is developed on a `milestone/N-name` branch, merged
-into `main` when its performance targets are met and tagged `vX.Y.0`. See
-[CHANGELOG.md](CHANGELOG.md).
+The binary is `target/release/katak` (`katak.exe` on Windows).
+
+* **Windows**: use the MSVC toolchain (`x86_64-pc-windows-msvc`, the
+  default) with the "Desktop development with C++" build tools. The
+  resulting `katak.exe` is portable. The optional installer is built with
+  [Inno Setup](https://jrsoftware.org/isinfo.php):
+  `ISCC.exe /DAppVersion=0.5.1 packaging\windows\katak.iss`.
+* **Linux**: install the X11/Wayland headers egui needs, e.g. on Debian or
+  Ubuntu `sudo apt install libxcb-render0-dev libxcb-shape0-dev
+  libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev`. File dialogs use
+  the XDG desktop portal, so GTK is not needed.
+* **macOS**: Xcode command line tools. Build both architectures with
+  `--target aarch64-apple-darwin` and `--target x86_64-apple-darwin`.
+
+CI (GitHub Actions) builds and tests on Windows, Linux and macOS on every
+push and pull request; pushing a `v*` tag builds release binaries for all
+platforms plus the Windows installer and attaches them to a GitHub Release.
+
+## How it works
+
+The file is memory-mapped (or read in bounded chunks on network drives) and
+never copied. A background thread builds a sparse, quote-aware index: one
+checkpoint per ~64 KB at a true row start, so a row inside a multi-line
+quoted field is never mistaken for a row start. The grid jumps to the
+nearest checkpoint and parses only the visible rows and columns. Edits live
+in an overlay over the unchanged file, with undo and redo; saving streams
+the file through the overlay into a temp file and renames it over the
+original. The details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+and the original requirements in [docs/SPEC.md](docs/SPEC.md).
 
 | Path | Contents |
 |------|----------|
@@ -263,3 +370,21 @@ into `main` when its performance targets are met and tagged `vX.Y.0`. See
 | `tools/katak-gen` | test-data generator |
 | `tools/katak-bench` | throughput and memory benchmarks on real files |
 | `docs/ARCHITECTURE.md` | design |
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md). Before every commit:
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Changes are listed in the [CHANGELOG](CHANGELOG.md). If Katak saved you
+from a frozen spreadsheet, a ⭐ on GitHub helps others find it.
+
+## License
+
+[MIT](LICENSE) © 2026 Erkin Pardayev

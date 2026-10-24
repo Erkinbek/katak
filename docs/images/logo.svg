@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Katak logo">
+  <title>Katak</title>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#0B1220"/>
+  <g fill="#64748B">
+    <rect x="11" y="11" width="12.5" height="12.5" rx="2.5"/>
+    <rect x="25.75" y="11" width="12.5" height="12.5" rx="2.5"/>
+    <rect x="40.5" y="11" width="12.5" height="12.5" rx="2.5"/>
+  </g>
+  <g fill="#334155">
+    <rect x="11" y="25.75" width="12.5" height="12.5" rx="2.5"/>
+    <rect x="40.5" y="25.75" width="12.5" height="12.5" rx="2.5"/>
+    <rect x="11" y="40.5" width="12.5" height="12.5" rx="2.5"/>
+    <rect x="25.75" y="40.5" width="12.5" height="12.5" rx="2.5"/>
+    <rect x="40.5" y="40.5" width="12.5" height="12.5" rx="2.5"/>
+  </g>
+  <rect x="25.75" y="25.75" width="12.5" height="12.5" rx="2.5" fill="#38BDF8"/>
+</svg>
