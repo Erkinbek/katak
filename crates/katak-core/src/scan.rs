@@ -49,6 +49,10 @@ pub struct RecSpan {
     /// Number of fields (unquoted delimiters + 1).
     pub fields: u64,
     pub term: Term,
+    /// The record contains an escaped quote, a backslash escape or text
+    /// after a closing quote: some decoded value is not a contiguous run of
+    /// its raw bytes. (Raw-byte prefilters are only exact without this.)
+    pub escaped: bool,
 }
 
 impl RecSpan {
@@ -116,6 +120,7 @@ pub struct Scanner<'d> {
     long_reported: bool,
     comment_start: u64,
     unterminated: Option<u64>,
+    escaped: bool,
     /// Bytes that end an unquoted run on the generic 1-byte path.
     special: [bool; 256],
     /// Mode entered after a record ends.
@@ -150,6 +155,7 @@ impl<'d> Scanner<'d> {
             long_reported: false,
             comment_start: 0,
             unterminated: None,
+            escaped: false,
             special: special_bytes(d),
             after_record: Self::after_record_mode(d, !d.fast),
         }
@@ -229,11 +235,13 @@ impl<'d> Scanner<'d> {
             end,
             fields: self.delims + 1,
             term,
+            escaped: self.escaped,
         };
         self.mode = self.after_record;
         self.rec_start = end;
         self.delims = 0;
         self.prev_delim = false;
+        self.escaped = false;
         if sink.record(&rec) == Flow::Stop {
             self.pos = end;
             return Some(Feed::Stopped);
@@ -259,6 +267,7 @@ impl<'d> Scanner<'d> {
                     end,
                     fields: self.delims + 1,
                     term: Term::None,
+                    escaped: self.escaped,
                 };
                 sink.record(&rec);
             }
@@ -474,12 +483,18 @@ impl<'d> Scanner<'d> {
                     }
                     if buf[h] != q {
                         // Backslash: skip the escaped byte.
+                        self.escaped = true;
                         p = (h + 2).min(len);
                         continue;
                     }
                     if h + 1 < len && buf[h + 1] == q {
+                        self.escaped = true;
                         p = h + 2;
                         continue;
+                    }
+                    // Text right after the closing quote is appended to the value.
+                    if h + 1 < len && !matches!(buf[h + 1], b'\n' | b'\r') && buf[h + 1] != delim {
+                        self.escaped = true;
                     }
                     self.check_long(base + h as u64, sink);
                     self.mode = Mode::Unquoted;
@@ -603,6 +618,19 @@ impl<'d> Scanner<'d> {
                     }
                 }
                 Mode::Unquoted | Mode::AfterQuoted => {
+                    if self.mode == Mode::AfterQuoted {
+                        // Text right after the closing quote is appended to
+                        // the value; from here on it behaves as unquoted.
+                        let separator = if self.d.whitespace {
+                            is_blank(u)
+                        } else {
+                            Self::matches::<U>(buf, full, p, &self.d.delim)
+                        };
+                        if !separator {
+                            self.escaped = true;
+                            self.mode = Mode::Unquoted;
+                        }
+                    }
                     if w == 1 && !self.special[(u & 0xFF) as usize] {
                         // Skip a run of ordinary bytes in one go.
                         let mut q = p + 1;
@@ -659,6 +687,7 @@ impl<'d> Scanner<'d> {
                     }
                     if u == q {
                         if p + w < full && U::get(buf, p + w) == q {
+                            self.escaped = true;
                             p += 2 * w;
                         } else {
                             self.check_long(base + p as u64, sink);
@@ -666,6 +695,7 @@ impl<'d> Scanner<'d> {
                             p += w;
                         }
                     } else if self.d.backslash && u == BACKSLASH {
+                        self.escaped = true;
                         p = (p + 2 * w).min(full);
                     } else {
                         p += w;
@@ -1053,6 +1083,72 @@ mod tests {
                         "split {step} {d:?} input {:?}",
                         String::from_utf8_lossy(&input)
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_flag_examples() {
+        let flag = |d: &Dialect, s: &[u8]| -> Vec<bool> {
+            scan_all(&d.compile().unwrap(), s, 0, usize::MAX)
+                .iter()
+                .map(|r| r.escaped)
+                .collect()
+        };
+        let d = Dialect::default();
+        assert_eq!(flag(&d, b"a,\"b\"\"c\",d\n\"ab\",c\n"), [true, false]);
+        assert_eq!(flag(&d, b"\"ab\"cd,e\nx\"y,z\n"), [true, false]);
+        let b = Dialect {
+            escape: Escape::Backslash,
+            ..Dialect::default()
+        };
+        assert_eq!(flag(&b, b"\"a\\\"b\",c\na\\b\n"), [true, false]);
+    }
+
+    #[test]
+    fn unescaped_records_contain_their_values_verbatim() {
+        // Without the flag, every decoded value is a contiguous run of the
+        // record's raw bytes: what raw-byte prefilters rely on.
+        let mut rng = Rng(1234);
+        for d in [
+            Dialect::default(),
+            Dialect {
+                trim: true,
+                ..Dialect::default()
+            },
+            Dialect {
+                escape: Escape::Backslash,
+                ..Dialect::default()
+            },
+            Dialect {
+                delimiter: Delimiter::Whitespace,
+                ..Dialect::default()
+            },
+            Dialect {
+                delimiter: Delimiter::Str("||".into()),
+                ..Dialect::default()
+            },
+        ] {
+            let c = d.compile().unwrap();
+            for _ in 0..500 {
+                let len = rng.below(50) as usize;
+                let input = random_input(&mut rng, b"ab,|| \t\"\\\n", len);
+                for r in scan_all(&c, &input, 0, usize::MAX) {
+                    if r.escaped {
+                        continue;
+                    }
+                    let content = &input[r.start as usize..r.content_end as usize];
+                    for f in crate::fields::split_all(&c, content) {
+                        let v = crate::fields::unquote(&c, &content[f.start..f.end], f.quoted);
+                        let ok = v.is_empty() || content.windows(v.len()).any(|w| w == &v[..]);
+                        assert!(
+                            ok,
+                            "{d:?}: value {:?} not in {:?}",
+                            String::from_utf8_lossy(&v),
+                            String::from_utf8_lossy(content)
+                        );
+                    }
                 }
             }
         }
