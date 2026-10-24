@@ -270,6 +270,18 @@ impl Document {
         self.opened.elapsed()
     }
 
+    /// A locator of its own for a background job (export of a selection).
+    pub fn job_locator(&self) -> Locator {
+        let (expected, avg) = self.sample_shape();
+        Locator::new(
+            self.source.clone(),
+            self.compiled.clone(),
+            self.index.clone(),
+            expected,
+            avg,
+        )
+    }
+
     /// What background jobs (search, filter) need to scan this document.
     pub fn target(&self) -> crate::search::Target {
         crate::search::Target {

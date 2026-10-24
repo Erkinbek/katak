@@ -86,6 +86,11 @@ impl<T: Copy> ChunkedVec<T> {
         }
     }
 
+    /// All elements in order.
+    pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.chunks.iter().flat_map(|c| c.iter().copied())
+    }
+
     /// Heap memory in bytes.
     pub fn heap_bytes(&self) -> usize {
         self.chunks

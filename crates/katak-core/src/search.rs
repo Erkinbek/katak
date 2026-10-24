@@ -90,6 +90,18 @@ impl Matcher {
             .collect()
     }
 
+    /// `cell` with its matches replaced by `with`. In regex mode `$1` and
+    /// `${name}` expand to capture groups; otherwise `with` is literal.
+    /// Empty matches are handled the regex way (no infinite loop).
+    pub fn replace<'a>(&self, cell: &'a str, with: &str, all: bool) -> Cow<'a, str> {
+        match (self.opts.regex, all) {
+            (true, true) => self.re.replace_all(cell, with),
+            (true, false) => self.re.replace(cell, with),
+            (false, true) => self.re.replace_all(cell, regex::NoExpand(with)),
+            (false, false) => self.re.replace(cell, regex::NoExpand(with)),
+        }
+    }
+
     /// Is column `c` searched?
     pub fn wants_column(&self, c: usize) -> bool {
         self.opts

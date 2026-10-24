@@ -144,8 +144,11 @@ pub struct Row {
 /// Shared, growing filter results.
 #[derive(Debug, Default)]
 pub struct FilterData {
-    /// Matching rows in file order (at most the cap).
+    /// Matching rows (at most the cap): in file order, or in sort order
+    /// when `sorted` is set.
     pub rows: ChunkedVec<Row>,
+    /// The rows are a sort permutation, not in file order.
+    pub sorted: bool,
     /// Matching rows found, including those beyond the cap.
     pub matched: u64,
     pub capped: bool,

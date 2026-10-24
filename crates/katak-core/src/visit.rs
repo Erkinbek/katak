@@ -15,7 +15,7 @@ use memchr::memmem;
 
 use crate::dialect::Compiled;
 use crate::job::JobCtl;
-use crate::scan::{Feed, Flow, RecSpan, Scanner, Sink};
+use crate::scan::{Collect, Feed, Flow, RecSpan, Scanner, Sink};
 use crate::source::{ChunkReader, Source};
 
 /// Records larger than this are visited with their first 64 MB only.
@@ -49,6 +49,39 @@ impl Prefilter {
             Prefilter::Regex(r) => r.find(hay).map(|m| m.start()),
         }
     }
+}
+
+/// Reads the record starting at `offset` (its extent and its content,
+/// clipped to [`MAX_RECORD_BYTES`]).
+pub fn read_record(src: &Source, d: &Compiled, offset: u64) -> io::Result<(RecSpan, Vec<u8>)> {
+    let mut reader = ChunkReader::cached(src, src.len(), 64 << 10);
+    let mut sc = Scanner::new(d, offset);
+    let mut out = Vec::new();
+    loop {
+        let w = reader.window(sc.pos())?;
+        let f = sc.feed(
+            w.buf,
+            w.base,
+            w.eof,
+            &mut Collect {
+                out: &mut out,
+                max: 1,
+            },
+        );
+        if !out.is_empty() || f == Feed::Done {
+            break;
+        }
+    }
+    let r = out.pop().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no record at byte {offset}"),
+        )
+    })?;
+    let len = ((r.content_end - r.start) as usize).min(MAX_RECORD_BYTES);
+    let mut content = vec![0u8; len];
+    src.read_at(r.start, &mut content)?;
+    Ok((r, content))
 }
 
 /// A record handed to the visitor callback.
