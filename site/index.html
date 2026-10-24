@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Katak – Open Huge CSV Files Instantly | Free Large CSV Viewer &amp; Editor</title>
+<meta name="description" content="Free, open-source viewer and editor for huge CSV and TSV files. Opens 10 GB in 0.2 s, searches at 1 GB/s, filters, sorts, edits and converts. Windows, macOS, Linux.">
+<link rel="canonical" href="https://erkinbek.github.io/katak/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Katak">
+<meta property="og:title" content="Katak – open huge CSV files instantly">
+<meta property="og:description" content="Free, open-source viewer and editor for 1 GB, 10 GB and 50 GB CSV files. Search, filter, sort, edit and convert without loading the file into memory.">
+<meta property="og:url" content="https://erkinbek.github.io/katak/">
+<meta property="og:image" content="https://erkinbek.github.io/katak/images/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="Katak: open huge CSV files instantly. A 10 GB file with 119 million rows on screen in 0.2 s.">
+<meta name="twitter:card" content="summary_large_image">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "Katak",
+      "description": "Free, open-source viewer and editor for huge CSV and TSV files. Opens files of any size instantly and searches, filters, sorts, edits and converts them without loading them into memory.",
+      "url": "https://erkinbek.github.io/katak/",
+      "applicationCategory": "UtilitiesApplication",
+      "operatingSystem": "Windows 10, Windows 11, macOS, Linux",
+      "downloadUrl": "https://github.com/Erkinbek/katak/releases/latest",
+      "installUrl": "https://github.com/Erkinbek/katak/releases/latest",
+      "license": "https://opensource.org/licenses/MIT",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "image": "https://erkinbek.github.io/katak/images/social-preview.png",
+      "screenshot": "https://erkinbek.github.io/katak/images/hero-light.webp",
+      "featureList": "Open CSV and TSV files of any size; search and regex search at about 1 GB/s; per-column filters; sort millions of rows; edit cells, rows and columns with undo; find and replace with capture groups; export and convert delimiter, encoding and line endings; byte-identical, atomic saves",
+      "author": { "@type": "Person", "name": "Erkin Pardayev", "url": "https://github.com/Erkinbek" },
+      "sameAs": ["https://github.com/Erkinbek/katak"]
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "How do I open a CSV file that is too large for Excel?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Open it in Katak with File → Open, drag and drop, or katak file.csv. There is no row limit: the first rows appear immediately and the rest of the file is indexed in the background. To use the data in Excel, filter it or select the part you need and export it as a smaller CSV." }
+        },
+        {
+          "@type": "Question",
+          "name": "How large a CSV file can Katak open?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Files are memory-mapped, so the limit is your disk, not your RAM. Katak is tested with 50 GB files, 119 million rows, 100 million one-character rows and 1,000,000 columns. The index takes about 0.03% of the file size." }
+        },
+        {
+          "@type": "Question",
+          "name": "Does Katak load the whole file into memory?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. Only the visible rows and columns are read and parsed. Search, filter, sort and save stream through the file on background threads with bounded memory; a 50 GB file open and indexed uses about 127 MB of RAM." }
+        },
+        {
+          "@type": "Question",
+          "name": "Will saving change data I did not edit?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. Untouched rows are copied byte for byte; Katak never reformats numbers or dates, strips leading zeros or trims whitespace. Saves go to a temp file that atomically replaces the original, so a crash never leaves a half-written file." }
+        },
+        {
+          "@type": "Question",
+          "name": "Can Katak convert a huge CSV file to another delimiter or encoding?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. Export writes all rows, the filtered rows, the sorted order or a selection with another delimiter, quoting policy, encoding or line ending. It streams, so converting a 10 GB file needs about 50 MB of RAM." }
+        },
+        {
+          "@type": "Question",
+          "name": "Is Katak free?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. Katak is open source under the MIT license, with no account, no telemetry and no network access." }
+        }
+      ]
+    }
+  ]
+}
+</script>
+
+<style>
+:root {
+  --bg: #ffffff;
+  --surface: #f6f8fb;
+  --text: #0f172a;
+  --muted: #475569;
+  --border: #e2e8f0;
+  --accent: #0369a1;
+  --accent-bg: #0284c7;
+  --accent-text: #ffffff;
+  --shadow: 0 10px 40px rgba(15, 23, 42, .12);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1220;
+    --surface: #111a2e;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --border: #1f2a40;
+    --accent: #38bdf8;
+    --accent-bg: #38bdf8;
+    --accent-text: #0b1220;
+    --shadow: 0 10px 40px rgba(0, 0, 0, .45);
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); }
+img { max-width: 100%; height: auto; display: block; }
+code { font: .9em ui-monospace, "Cascadia Code", Consolas, Menlo, monospace; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: .05em .35em; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
+
+.top { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
+.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 700; font-size: 20px; text-decoration: none; }
+.top nav { display: flex; gap: 20px; font-size: 15px; }
+.top nav a { color: var(--muted); text-decoration: none; }
+.top nav a:hover { color: var(--text); }
+
+.hero { text-align: center; padding: 64px 0 24px; }
+h1 { font-size: clamp(34px, 6vw, 60px); line-height: 1.08; letter-spacing: -.02em; margin: 0 0 18px; }
+h1 span { color: var(--accent); }
+.lead { font-size: clamp(17px, 2.2vw, 21px); color: var(--muted); max-width: 760px; margin: 0 auto 28px; }
+.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-weight: 600; text-decoration: none; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent-bg); border-color: var(--accent-bg); color: var(--accent-text); }
+.btn:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.note { color: var(--muted); font-size: 14px; margin: 14px 0 0; }
+
+figure { margin: 40px 0 0; }
+.shot img { border-radius: 12px; border: 1px solid var(--border); box-shadow: var(--shadow); }
+figcaption { color: var(--muted); font-size: 14px; margin-top: 12px; text-align: center; }
+
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 56px 0 8px; }
+.stats div { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px; text-align: center; }
+.stats b { display: block; font-size: 30px; color: var(--accent); line-height: 1.2; }
+.stats span { color: var(--muted); font-size: 15px; }
+
+section { padding: 48px 0 8px; }
+h2 { font-size: clamp(26px, 3.6vw, 36px); line-height: 1.2; letter-spacing: -.01em; margin: 0 0 16px; }
+h3 { font-size: 22px; margin: 0 0 10px; }
+.prose { max-width: 780px; }
+.feature { display: grid; grid-template-columns: 5fr 7fr; gap: 36px; align-items: center; padding: 28px 0; }
+.feature:nth-of-type(even) { grid-template-columns: 7fr 5fr; }
+.feature:nth-of-type(even) .text { order: 2; }
+.feature ul { padding-left: 20px; margin: 10px 0 0; }
+.feature li { margin: 4px 0; }
+.feature p { margin: 0; color: var(--muted); }
+.feature .shot img { border-radius: 10px; }
+
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+.card h3 { font-size: 18px; margin-bottom: 6px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+.table { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: 0; }
+th { background: var(--surface); font-weight: 600; }
+td.num { font-weight: 700; white-space: nowrap; }
+
+.downloads { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.downloads .card a { display: block; margin-top: 8px; font-weight: 600; }
+
+details { border: 1px solid var(--border); border-radius: 10px; padding: 0 18px; margin: 10px 0; background: var(--surface); }
+summary { cursor: pointer; font-weight: 600; padding: 14px 0; }
+details p { margin: 0 0 16px; color: var(--muted); }
+
+footer { border-top: 1px solid var(--border); margin-top: 56px; padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between; }
+footer a { color: var(--muted); }
+
+@media (max-width: 860px) {
+  .top nav a.hide-sm { display: none; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .feature, .feature:nth-of-type(even) { grid-template-columns: 1fr; gap: 18px; }
+  .feature:nth-of-type(even) .text { order: 0; }
+  .grid3, .downloads { grid-template-columns: 1fr; }
+  .hero { padding-top: 40px; }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="images/logo.svg" width="32" height="32" alt="">Katak</a>
+    <nav aria-label="Main">
+      <a class="hide-sm" href="#features">Features</a>
+      <a class="hide-sm" href="#benchmarks">Benchmarks</a>
+      <a href="#download">Download</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/Erkinbek/katak">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <section class="hero">
+      <h1>Open huge CSV files <span>instantly</span></h1>
+      <p class="lead">Katak is a free, open-source viewer and editor for CSV and TSV files of 1&nbsp;GB, 10&nbsp;GB, 50&nbsp;GB and more. Search, filter, sort, edit and convert them without loading the file into memory, on Windows, macOS and Linux.</p>
+      <div class="cta">
+        <a class="btn primary" id="download-button" href="#download">Download</a>
+        <a class="btn" href="https://github.com/Erkinbek/katak">★ Star on GitHub</a>
+      </div>
+      <p class="note">MIT license · one 12 MB portable binary · no install, no account, no telemetry</p>
+      <figure class="shot">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="images/hero-dark.webp">
+          <img src="images/hero-light.webp" width="1280" height="800" fetchpriority="high" alt="Katak showing a 10 GB CSV file with 119 million rows, opened instantly while it is indexed in the background">
+        </picture>
+        <figcaption>A 10 GB CSV file with 119 million rows: on screen 0.2 s after launch, indexed in the background at 1.6 GB/s.</figcaption>
+      </figure>
+    </section>
+
+    <div class="stats" role="list">
+      <div role="listitem"><b>0.2 s</b><span>to show a 10 GB or 50 GB file</span></div>
+      <div role="listitem"><b>1 GB/s</b><span>search, regex and text filters</span></div>
+      <div role="listitem"><b>127 MB</b><span>RAM with a 50 GB file open</span></div>
+      <div role="listitem"><b>0 bytes</b><span>changed in rows you did not edit</span></div>
+    </div>
+
+    <section id="too-big-for-excel" class="prose">
+      <h2>CSV file too large for Excel?</h2>
+      <p>Excel and LibreOffice Calc stop at 1,048,576 rows. Text editors try to read the whole file into memory and freeze. Importing into a database takes minutes before you see a single row.</p>
+      <p>Katak memory-maps the file, reads only what is on screen and builds a sparse index in a background thread, so a file with hundreds of millions of rows opens as fast as a small one and the window never freezes. Filter or select the rows you need and export them as a CSV that Excel can open, or work with the whole file directly.</p>
+    </section>
+
+    <section id="features">
+      <h2>Features</h2>
+
+      <div class="feature">
+        <div class="text">
+          <h3>Opens any CSV, TSV or delimited text file</h3>
+          <p>Delimiter, quotes, header, encoding and line endings are detected from the first megabyte. Change anything in the parsing dialog with a live preview: comma, semicolon, tab, pipe or custom multi-character delimiters, whitespace-aligned columns, quote and escape styles, skipped and comment lines, and a raw-text view.</p>
+        </div>
+        <figure class="shot"><picture>
+          <source media="(prefers-color-scheme: dark)" srcset="images/parse-dark.webp">
+          <img src="images/parse-light.webp" width="1280" height="800" loading="lazy" alt="Parsing options dialog with a live preview of a semicolon-separated file">
+        </picture></figure>
+      </div>
+
+      <div class="feature">
+        <div class="text">
+          <h3>Search and filter at gigabytes per second</h3>
+          <p>Plain text or regex search with match case, whole word, whole cell and column scope. Per-column filters (contains, equals, starts with, regex, empty, numeric range) combined with AND. Results appear while the scan runs, and both see your unsaved edits.</p>
+        </div>
+        <figure class="shot"><picture>
+          <source media="(prefers-color-scheme: dark)" srcset="images/filter-dark.webp">
+          <img src="images/filter-light.webp" width="1280" height="800" loading="lazy" alt="Filtering a 10 GB CSV file: 1.5 million matching rows shown while the filter runs">
+        </picture></figure>
+      </div>
+
+      <div class="feature">
+        <div class="text">
+          <h3>Sorts millions of rows</h3>
+          <p>Sort by any column as numbers, dates or text, ascending or descending. 12 million rows sort in 1.2 seconds within a configurable memory budget. The sort is a view: the file only changes if you export or save in sorted order.</p>
+        </div>
+        <figure class="shot"><picture>
+          <source media="(prefers-color-scheme: dark)" srcset="images/sort-dark.webp">
+          <img src="images/sort-light.webp" width="1280" height="800" loading="lazy" alt="12 million rows sorted by amount in descending order">
+        </picture></figure>
+      </div>
+
+      <div class="feature">
+        <div class="text">
+          <h3>Edits like a spreadsheet, saves without surprises</h3>
+          <p>Edit cells, insert and delete rows and columns, copy and paste with Excel, find and replace with regex capture groups, and undo anything. Saving keeps the original delimiter, quoting, encoding and line endings, copies untouched rows byte for byte and replaces the file atomically, with an optional backup.</p>
+        </div>
+        <figure class="shot"><picture>
+          <source media="(prefers-color-scheme: dark)" srcset="images/edit-dark.webp">
+          <img src="images/edit-light.webp" width="1280" height="800" loading="lazy" alt="Editing cells and rows in a large CSV file">
+        </picture></figure>
+      </div>
+
+      <div class="feature">
+        <div class="text">
+          <h3>Converts and exports</h3>
+          <p>Export all rows, the filtered or sorted rows, or a selection, with another delimiter, quoting, encoding or line ending: CSV to TSV, semicolons to commas, Windows-1251 to UTF-8. Exports stream, so a 10 GB conversion uses about 50 MB of RAM.</p>
+        </div>
+        <figure class="shot"><picture>
+          <source media="(prefers-color-scheme: dark)" srcset="images/export-dark.webp">
+          <img src="images/export-light.webp" width="1280" height="800" loading="lazy" alt="Export dialog converting a CSV file to TSV">
+        </picture></figure>
+      </div>
+
+      <div class="grid3">
+        <div class="card"><h3>Awkward files welcome</h3><p>Multi-line quoted fields, ragged rows, unterminated quotes, NUL bytes, invalid UTF-8, a single 500 MB cell.</p></div>
+        <div class="card"><h3>Wide files</h3><p>Only visible rows and columns are parsed and drawn, so 10,000 or 1,000,000 columns scroll smoothly.</p></div>
+        <div class="card"><h3>Every encoding</h3><p>UTF-8, UTF-16, Windows code pages, ISO-8859, KOI8, Shift_JIS, GBK, Big5 and more, auto-detected.</p></div>
+        <div class="card"><h3>Network drives</h3><p>Slow or disconnected shares are read in the background and never freeze the window.</p></div>
+        <div class="card"><h3>Changes on disk</h3><p>If another program appends to or replaces the open file, Katak offers to reload it.</p></div>
+        <div class="card"><h3>Keyboard friendly</h3><p>Go to row or byte offset, F3 to the next match, Ctrl+Home/End, tabs, zoom, light and dark themes.</p></div>
+      </div>
+    </section>
+
+    <section id="benchmarks">
+      <h2>Benchmarks</h2>
+      <p class="prose">Measured on an Intel Core Ultra 9 285 with Windows 11, files in the OS cache, using the generator and benchmark tools in the repository. <a href="https://github.com/Erkinbek/katak#performance">All measurements</a>.</p>
+      <div class="table">
+        <table>
+          <thead><tr><th scope="col">Task</th><th scope="col">Result</th></tr></thead>
+          <tbody>
+            <tr><td>Launch to first screen, 10 GB / 50 GB file</td><td class="num">198 ms / 231 ms</td></tr>
+            <tr><td>Background indexing (quote-aware)</td><td class="num">1.4–1.7 GB/s</td></tr>
+            <tr><td>Literal search, 1 GB / 10 GB file</td><td class="num">1.3 GB/s / 1.0 GB/s</td></tr>
+            <tr><td>Regex search, 1 GB file</td><td class="num">1.1–1.3 GB/s</td></tr>
+            <tr><td>Filter, 1 GB file (text / numeric range)</td><td class="num">1.3 GB/s / 792 MB/s</td></tr>
+            <tr><td>Sort 12 million rows by a number column</td><td class="num">1.2 s</td></tr>
+            <tr><td>Convert 10 GB to TSV</td><td class="num">350–400 MB/s, 53 MB RAM</td></tr>
+            <tr><td>Memory with a 50 GB file open and indexed</td><td class="num">127 MB</td></tr>
+            <tr><td>Index size</td><td class="num">0.03 % of the file</td></tr>
+            <tr><td>Longest UI frame while indexing a 50 GB file</td><td class="num">4.7 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="download">
+      <h2>Download</h2>
+      <div class="downloads">
+        <div class="card">
+          <h3>Windows 10 / 11</h3>
+          <p>Portable .exe, or an installer that adds "Open with" for .csv, .tsv and .txt.</p>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64.exe">Portable katak.exe (x64)</a>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-windows-x64-setup.exe">Installer (x64)</a>
+        </div>
+        <div class="card">
+          <h3>macOS</h3>
+          <p>Not notarized yet: run <code>xattr -d com.apple.quarantine katak</code> once after extracting.</p>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-macos-arm64.tar.gz">Apple Silicon (arm64)</a>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-macos-x64.tar.gz">Intel (x64)</a>
+        </div>
+        <div class="card">
+          <h3>Linux</h3>
+          <p>x64, glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+), X11 or Wayland.</p>
+          <a href="https://github.com/Erkinbek/katak/releases/latest/download/katak-linux-x64.tar.gz">katak-linux-x64.tar.gz</a>
+          <a href="https://github.com/Erkinbek/katak#building-from-source">Build from source</a>
+        </div>
+      </div>
+      <p class="note">All versions and SHA-256 checksums: <a href="https://github.com/Erkinbek/katak/releases">GitHub releases</a>. With Rust installed: <code>cargo install --git https://github.com/Erkinbek/katak --locked katak</code></p>
+    </section>
+
+    <section id="faq" class="prose">
+      <h2>Frequently asked questions</h2>
+      <details open>
+        <summary>How do I open a CSV file that is too large for Excel?</summary>
+        <p>Open it in Katak with File → Open, drag and drop, or <code>katak file.csv</code>. There is no row limit: the first rows appear immediately and the rest of the file is indexed in the background. To use the data in Excel, filter it or select the part you need and export it as a smaller CSV.</p>
+      </details>
+      <details>
+        <summary>How large a CSV file can Katak open?</summary>
+        <p>Files are memory-mapped, so the limit is your disk, not your RAM. Katak is tested with 50 GB files, 119 million rows, 100 million one-character rows and 1,000,000 columns. The index takes about 0.03% of the file size.</p>
+      </details>
+      <details>
+        <summary>Does Katak load the whole file into memory?</summary>
+        <p>No. Only the visible rows and columns are read and parsed. Search, filter, sort and save stream through the file on background threads with bounded memory; a 50 GB file open and indexed uses about 127 MB of RAM.</p>
+      </details>
+      <details>
+        <summary>Will saving change data I did not edit?</summary>
+        <p>No. Untouched rows are copied byte for byte; Katak never reformats numbers or dates, strips leading zeros or trims whitespace. Saves go to a temp file that atomically replaces the original, so a crash never leaves a half-written file.</p>
+      </details>
+      <details>
+        <summary>Can Katak convert a huge CSV file to another delimiter or encoding?</summary>
+        <p>Yes. Export writes all rows, the filtered rows, the sorted order or a selection with another delimiter, quoting policy, encoding or line ending. It streams, so converting a 10 GB file needs about 50 MB of RAM.</p>
+      </details>
+      <details>
+        <summary>Is Katak free?</summary>
+        <p>Yes. Katak is open source under the MIT license, with no account, no telemetry and no network access. The source code is on <a href="https://github.com/Erkinbek/katak">GitHub</a>.</p>
+      </details>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Katak ("cell" in Uzbek) · MIT license · © 2026 Erkin Pardayev</span>
+    <span>
+      <a href="https://github.com/Erkinbek/katak">Source code</a> ·
+      <a href="https://github.com/Erkinbek/katak/releases">Releases</a> ·
+      <a href="https://github.com/Erkinbek/katak/issues">Issues</a> ·
+      <a href="https://github.com/Erkinbek/katak/blob/main/CHANGELOG.md">Changelog</a>
+    </span>
+  </div>
+</footer>
+
+<script>
+// Point the main button at the build for this computer.
+(function () {
+  var ua = navigator.userAgent;
+  var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  var base = "https://github.com/Erkinbek/katak/releases/latest/download/";
+  var button = document.getElementById("download-button");
+  if (/Android|iPhone|iPad|iPod/i.test(ua)) return;
+  if (/Win/i.test(platform) || /Windows/i.test(ua)) {
+    button.href = base + "katak-windows-x64.exe";
+    button.textContent = "Download for Windows";
+  } else if (/Mac/i.test(platform) || /Mac OS X/i.test(ua)) {
+    button.textContent = "Download for macOS";
+  } else if (/Linux/i.test(platform) || /Linux/i.test(ua)) {
+    button.href = base + "katak-linux-x64.tar.gz";
+    button.textContent = "Download for Linux";
+  }
+})();
+</script>
+</body>
+</html>
