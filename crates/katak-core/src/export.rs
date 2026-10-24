@@ -361,7 +361,7 @@ fn cancelled() -> io::Error {
 }
 
 /// Writes the export to `path` (temp file, fsync, atomic rename).
-/// `records_rewritten` in the report is the number of rows written.
+/// `records_rewritten` in the report is the number of data rows written.
 pub fn export(
     input: ExportInput,
     scope: Scope,
@@ -398,6 +398,8 @@ fn export_with(
         }
         if let Some(h) = input.header {
             e.record_at(h)?;
+            // The report counts data rows.
+            e.rows = 0;
         }
         let t = &input.target;
         match &scope {

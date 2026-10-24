@@ -199,6 +199,17 @@ impl ExportDialog {
         None
     }
 
+    /// `--show exportto=PATH`: exports with these options as TSV, no dialog.
+    pub fn export_tsv(&mut self, tab: &mut Tab, path: PathBuf, notify: &Notify) -> Option<String> {
+        self.delim = Delim::Tab;
+        let own = vec![tab.path.clone()];
+        if self.start(tab, path, &own, notify) {
+            None
+        } else {
+            self.error.clone()
+        }
+    }
+
     fn start(&mut self, tab: &mut Tab, path: PathBuf, open: &[PathBuf], notify: &Notify) -> bool {
         if open.iter().any(|p| same_file(p, &path)) {
             self.error = Some(

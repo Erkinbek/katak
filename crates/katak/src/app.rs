@@ -1385,6 +1385,14 @@ impl KatakApp {
                     }
                 }
                 Some("export") => self.open_export(None),
+                Some(s) if s.starts_with("exportto=") => {
+                    let notify = self.notify.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let path = PathBuf::from(&s["exportto=".len()..]);
+                        let mut d = ExportDialog::new(tab);
+                        self.messages.extend(d.export_tsv(tab, path, &notify));
+                    }
+                }
                 Some(s) if s.starts_with("replace=") => {
                     let notify = self.notify.clone();
                     if let Some(tab) = self.tabs.get_mut(self.active)
