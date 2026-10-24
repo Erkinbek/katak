@@ -120,7 +120,7 @@ The binary is `target/release/katak` (`katak.exe` on Windows).
   default) with the "Desktop development with C++" build tools. The
   resulting `katak.exe` is portable. The optional installer is built with
   [Inno Setup](https://jrsoftware.org/isinfo.php):
-  `ISCC.exe /DAppVersion=0.1.0 packaging\windows\katak.iss`.
+  `ISCC.exe /DAppVersion=0.4.0 packaging\windows\katak.iss`.
 * **Linux**: install the X11/Wayland headers egui needs, e.g. on Debian or
   Ubuntu `sudo apt install libxcb-render0-dev libxcb-shape0-dev
   libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev`. File dialogs use
