@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an idea or an improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the task or the file, and what makes it hard today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: How you imagine it working in Katak.
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else?
+      description: Other tools that do this well, file sizes involved, screenshots.

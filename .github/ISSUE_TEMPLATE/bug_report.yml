@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work, crashes, hangs or shows wrong data
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: file
+    attributes:
+      label: What does the file look like?
+      description: >
+        Size, delimiter, quoting, encoding, line endings, number of columns.
+        Please do not attach private data; a few made-up lines with the same
+        structure are usually enough.
+      placeholder: "2.3 GB, semicolon-separated, UTF-8 with BOM, CRLF, 40 columns, quoted fields with line breaks"
+  - type: input
+    id: version
+    attributes:
+      label: Katak version
+      description: Help → About Katak
+      placeholder: "0.5.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (X11)
+        - Linux (Wayland)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else?
+      description: Screenshots, error messages, the drive type (local, network, USB).
