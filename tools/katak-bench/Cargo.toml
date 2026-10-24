@@ -1,0 +1,12 @@
+[package]
+name = "katak-bench"
+description = "Measures Katak indexing/search/filter/save throughput on real files"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+katak-core.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "katak"
+description = "Katak: a fast, non-freezing viewer/editor for huge CSV/TSV files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "katak"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "persistence", "clipboard", "accesskit"] }
+katak-core.workspace = true
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[lints]
+workspace = true

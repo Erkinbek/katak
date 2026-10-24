@@ -1,0 +1,11 @@
+[package]
+name = "katak-gen"
+description = "Generates large and pathological test files for Katak"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

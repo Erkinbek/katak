@@ -60,7 +60,14 @@ the scripted UI self-test used to measure frame times).
 
 `Source` is immutable and shared as `Arc<Source>`:
 
-* **Mapped**: `memmap2::Mmap` over the whole file. Used for local fixed drives.
+* **Mapped views** (local fixed drives): random access maps 16 MB views
+  (overlapping by 8 MB, so any request up to 8 MB fits in one view) on
+  demand and keeps 16 of them in an LRU. Slices are handed out as `Bytes`
+  handles holding an `Arc` of their view. The file is never mapped as a
+  whole: Windows charges the page-table entries of a mapped view to the
+  process, about 2 MB per GB — measured: opening a 50 GB file with one
+  whole-file view cost 102.7 MB of private memory before reading a byte;
+  with on-demand views, 3.1 MB.
 * **Buffered**: positional reads (`seek_read` / `read_at`) through a small LRU
   block cache (1 MB blocks). Used when mapping fails, for UNC/network paths and,
   on Windows, for remote or removable drives (`GetDriveTypeW`): a page fault on
@@ -68,11 +75,13 @@ the scripted UI self-test used to measure frame times).
   `read` is just an error we can show.
 
 Sequential consumers (indexer, search, filter, sort, save) use `ChunkReader`,
-a `fill`/`consume` reader: for a mapping it hands out sub-slices of the map
-(zero copy); for buffered sources it refills a reusable buffer, keeping the
+a `fill`/`consume` reader that refills a reusable buffer with positional
+reads — for mapped files too, because copying from the OS cache is faster
+than faulting pages in and does not grow page tables. It keeps the
 unconsumed tail plus a small look-behind history so state machines can resume
 across chunk boundaries. Matches and fields that span chunk boundaries are
-therefore handled by the same code in both modes.
+therefore handled by the same code in every mode. UI-side reads use
+`ChunkReader::cached`, which borrows mapped views or the block cache.
 
 The source length is fixed at open time. Bytes appended later by another
 process are ignored until the user reloads (external changes are detected by
@@ -288,13 +297,18 @@ The grid shows one of:
 
 | item                         | size |
 |------------------------------|------|
-| checkpoints                  | ~12.5 MB |
-| block cache / row cache      | ≤ 64 MB |
+| checkpoints                  | ~12.5 MB (measured: 16 MB capacity) |
+| scan buffer of a running job | 16 MB |
+| record block cache           | ≤ 256K records (~10 MB) |
+| mapped views                 | 16 × 24 MB of address space, page tables only |
 | detection sample             | 1 MB |
-| egui + GPU buffers           | ~50–100 MB |
+| egui + GPU buffers           | ~100 MB |
 | search/filter result caps    | bounded, configurable |
 
-The mapping itself is file-backed and does not count as private memory.
+Mapped pages are file-backed and do not count as private memory; their
+page-table entries do, which is why views are small and bulk scans read.
+Measured with the 50 GB file indexed: 24 MB private in the core, 127 MB for
+the whole app.
 
 ## 15. Testing and measurement
 

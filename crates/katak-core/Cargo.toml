@@ -1,0 +1,28 @@
+[package]
+name = "katak-core"
+description = "File access, quote-aware sparse index, edit overlay, search and save engine of the Katak CSV viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytecount = { version = "0.6.9", features = ["runtime-dispatch-simd"] }
+chardetng = "1.0.0"
+encoding_rs = "0.8.42"
+memchr = "2.8.3"
+memmap2 = "0.9.12"
+parking_lot = "0.13"
+rayon = "1.12.0"
+regex = "1.13.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+csv = "1.4.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
