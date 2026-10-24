@@ -81,7 +81,10 @@ pub fn detect(sample: &[u8], whole_file: bool) -> Detection {
     let mut sep_line = None;
     if let Some(first) = text.lines().next() {
         let f = first.trim_end_matches('\r');
-        if f.len() >= 5 && f[..4].eq_ignore_ascii_case("sep=") && f[4..].chars().count() == 1 {
+        if f.len() >= 5
+            && f.as_bytes()[..4].eq_ignore_ascii_case(b"sep=")
+            && f[4..].chars().count() == 1
+        {
             sep_line = f[4..].chars().next();
             let skip = first.len()
                 + text[first.len()..]
@@ -350,6 +353,15 @@ mod tests {
             "id    name      value\n1     foo       3.5\n22    barbaz    10.25\n333   q         7\n",
         );
         assert_eq!(d.delimiter, Delimiter::Whitespace);
+    }
+
+    #[test]
+    fn non_ascii_first_line() {
+        // Byte 4 is inside a multi-byte character: must not panic.
+        assert_eq!(
+            det("имя,город\nАнна,Ташкент\n").delimiter,
+            Delimiter::Char(',')
+        );
     }
 
     #[test]
