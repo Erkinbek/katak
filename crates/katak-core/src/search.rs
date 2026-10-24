@@ -120,16 +120,14 @@ fn core_pattern(opts: &SearchOptions) -> String {
 /// * UTF-8 files: the pattern itself (anchors excluded: in raw bytes they
 ///   would refer to the record, not the cell). Whole word/cell are left to
 ///   the exact match.
-/// * Other ASCII-compatible encodings: only a case-sensitive ASCII literal,
-///   whose bytes are identical in the file.
-/// * UTF-16: none (records are decoded).
+/// * Other encodings (UTF-16, code pages): a case-sensitive literal,
+///   transcoded to the file's encoding. Otherwise records are decoded.
 pub fn prefilter_for(opts: &SearchOptions, enc: TextEncoding) -> Option<Prefilter> {
     if opts.pattern.is_empty() {
         return None;
     }
     let literal_cs = !opts.regex && opts.case_sensitive;
     match enc {
-        TextEncoding::Utf16Le | TextEncoding::Utf16Be => None,
         TextEncoding::Utf8 if literal_cs => Some(Prefilter::literal(opts.pattern.as_bytes())),
         TextEncoding::Utf8 => {
             let core = core_pattern(opts);
@@ -148,9 +146,7 @@ pub fn prefilter_for(opts: &SearchOptions, enc: TextEncoding) -> Option<Prefilte
                 .ok()
                 .map(Prefilter::Regex)
         }
-        _ if literal_cs && opts.pattern.is_ascii() => {
-            Some(Prefilter::literal(opts.pattern.as_bytes()))
-        }
+        _ if literal_cs => Prefilter::transcoded(&opts.pattern, enc),
         _ => None,
     }
 }
@@ -384,10 +380,20 @@ mod tests {
             )
             .is_some()
         );
-        assert!(prefilter_for(&opts("x"), TextEncoding::Utf16Le).is_none());
+        assert!(prefilter_for(&opts("x"), TextEncoding::Utf16Le).is_some());
         let cp1251 = TextEncoding::Other(encoding_rs::WINDOWS_1251);
         assert!(prefilter_for(&opts("abc"), cp1251).is_some());
-        assert!(prefilter_for(&opts("абв"), cp1251).is_none());
+        assert!(prefilter_for(&opts("абв"), cp1251).is_some());
+        assert!(
+            prefilter_for(
+                &SearchOptions {
+                    case_sensitive: false,
+                    ..opts("абв")
+                },
+                cp1251
+            )
+            .is_none()
+        );
     }
 
     fn search_file(data: &[u8], d: &Dialect, o: SearchOptions, cap: usize) -> (Vec<Hit>, bool) {
@@ -449,6 +455,39 @@ mod tests {
         // Header row is not searched.
         let (hits, _) = search_file(data, &d, opts("name"), 100);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_files_are_searchable() {
+        let text = "id,имя\n1,Анна\n2,Борис\n3,анна\n";
+        for enc in [
+            TextEncoding::Utf16Le,
+            TextEncoding::Utf16Be,
+            TextEncoding::Other(encoding_rs::WINDOWS_1251),
+        ] {
+            let mut bytes = Vec::new();
+            enc.encode(text, &mut bytes);
+            let d = Dialect {
+                encoding: enc,
+                ..Dialect::default()
+            };
+            let (hits, _) = search_file(&bytes, &d, opts("Анна"), 100);
+            assert_eq!(
+                hits.iter().map(|h| h.record).collect::<Vec<_>>(),
+                vec![1],
+                "{enc:?}"
+            );
+            let ci = SearchOptions {
+                case_sensitive: false,
+                ..opts("АННА")
+            };
+            let (hits, _) = search_file(&bytes, &d, ci, 100);
+            assert_eq!(
+                hits.iter().map(|h| h.record).collect::<Vec<_>>(),
+                vec![1, 3],
+                "{enc:?}"
+            );
+        }
     }
 
     #[test]

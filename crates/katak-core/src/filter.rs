@@ -124,12 +124,11 @@ fn prefilter(filters: &[ColumnFilter], enc: TextEncoding) -> Option<Prefilter> {
             _ => return None,
         };
         match enc {
-            TextEncoding::Utf16Le | TextEncoding::Utf16Be => None,
             TextEncoding::Utf8 if f.case_sensitive => Some(Prefilter::literal(s.as_bytes())),
             TextEncoding::Utf8 => regex::bytes::Regex::new(&format!("(?i){}", regex::escape(s)))
                 .ok()
                 .map(Prefilter::Regex),
-            _ if f.case_sensitive && s.is_ascii() => Some(Prefilter::literal(s.as_bytes())),
+            _ if f.case_sensitive => Prefilter::transcoded(s, enc),
             _ => None,
         }
     })

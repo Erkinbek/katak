@@ -34,6 +34,14 @@ impl Prefilter {
         Prefilter::Literal(Box::new(memmem::Finder::new(needle).into_owned()))
     }
 
+    /// A literal transcoded to the file's encoding: in any stateless
+    /// encoding, a value containing the text contains these bytes. `None`
+    /// when the text cannot be represented (then nothing can match).
+    pub fn transcoded(text: &str, enc: crate::encoding::TextEncoding) -> Option<Prefilter> {
+        let mut bytes = Vec::new();
+        (enc.encode(text, &mut bytes) == 0 && !bytes.is_empty()).then(|| Prefilter::literal(&bytes))
+    }
+
     /// Start of the first possible match in `hay`.
     pub fn find(&self, hay: &[u8]) -> Option<usize> {
         match self {
