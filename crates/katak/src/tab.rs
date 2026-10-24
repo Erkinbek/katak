@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use katak_core::document::{Document, OpenOptions};
+use katak_core::export::{self, ExportInput, ExportOptions, Scope};
 use katak_core::job::{Job, Notify};
 use katak_core::logical::LRow;
 use katak_core::save::{self, SaveReport};
+use katak_core::search::Matcher;
+use katak_core::sort::SortSpec;
 
 use crate::grid::{Grid, GridInfo};
 use crate::parse_dialog::ParseDialog;
@@ -25,11 +28,59 @@ pub struct CellViewer {
     pub original: String,
 }
 
-/// A save in progress.
+/// What a background write is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteKind {
+    /// Save or Save as (the tab then shows the target).
+    Save,
+    /// Replace All rewrote the file in place.
+    Rewrite,
+    /// Export (the tab keeps its file); `open` shows the result in a tab.
+    Export { open: bool },
+}
+
+impl WriteKind {
+    pub fn verb(self) -> &'static str {
+        match self {
+            WriteKind::Save => "Saving",
+            WriteKind::Rewrite => "Replacing",
+            WriteKind::Export { .. } => "Exporting",
+        }
+    }
+}
+
+/// A save, rewrite or export in progress.
 pub struct SaveJob {
     pub job: Job,
     pub target: PathBuf,
     pub result: Arc<Mutex<Option<Result<SaveReport, String>>>>,
+    pub kind: WriteKind,
+}
+
+impl SaveJob {
+    fn spawn(
+        name: &'static str,
+        kind: WriteKind,
+        target: PathBuf,
+        notify: Notify,
+        write: impl FnOnce(&katak_core::job::JobCtl) -> Result<SaveReport, String> + Send + 'static,
+    ) -> SaveJob {
+        let result = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        let job = Job::spawn(name, notify, move |ctl| {
+            let res = write(ctl);
+            if let Ok(mut slot) = r.lock() {
+                *slot = Some(res);
+            }
+            Ok(())
+        });
+        SaveJob {
+            job,
+            target,
+            result,
+            kind,
+        }
+    }
 }
 
 pub struct Tab {
@@ -44,7 +95,14 @@ pub struct Tab {
     pub banner_dismissed: bool,
     pub search: crate::search_ui::SearchBar,
     pub filter: crate::filter_ui::FilterBar,
+    pub sort: Option<crate::sort_ui::SortState>,
+    /// A sort waiting for the filter to finish (or to be restarted).
+    pub sort_pending: Option<SortSpec>,
+    pub export_dialog: Option<crate::export_ui::ExportDialog>,
+    /// Save, Save as or Replace All rewrite (edits are blocked meanwhile).
     pub save: Option<SaveJob>,
+    /// Export (runs alongside editing; uses a snapshot of the edits).
+    pub export: Option<SaveJob>,
 }
 
 impl Tab {
@@ -67,7 +125,11 @@ impl Tab {
             banner_dismissed: false,
             search: Default::default(),
             filter: Default::default(),
+            sort: None,
+            sort_pending: None,
+            export_dialog: None,
             save: None,
+            export: None,
         })
     }
 
@@ -105,20 +167,73 @@ impl Tab {
     /// Starts writing the document to `target` in the background.
     pub fn start_save(&mut self, target: PathBuf, backup: bool, notify: Notify) {
         let input = self.doc.save_input(self.info.columns.max(1));
-        let result = Arc::new(Mutex::new(None));
-        let (r, t) = (result.clone(), target.clone());
-        let job = Job::spawn("save", notify, move |ctl| {
-            let res = save::save_file(&input, &t, backup, ctl).map_err(|e| e.to_string());
-            if let Ok(mut slot) = r.lock() {
-                *slot = Some(res);
-            }
-            Ok(())
-        });
-        self.save = Some(SaveJob {
-            job,
+        let t = target.clone();
+        self.save = Some(SaveJob::spawn(
+            "save",
+            WriteKind::Save,
             target,
-            result,
-        });
+            notify,
+            move |ctl| save::save_file(&input, &t, backup, ctl).map_err(|e| e.to_string()),
+        ));
+    }
+
+    /// Replace All above the edit threshold: rewrites the file in one pass.
+    /// The caller makes sure there are no unsaved edits.
+    pub fn start_rewrite(
+        &mut self,
+        matcher: Arc<Matcher>,
+        with: String,
+        backup: bool,
+        notify: Notify,
+    ) {
+        let input = self.doc.save_input(self.info.columns.max(1));
+        let target = self.path.clone();
+        let t = target.clone();
+        self.save = Some(SaveJob::spawn(
+            "replace",
+            WriteKind::Rewrite,
+            target,
+            notify,
+            move |ctl| {
+                save::save_with(&t, backup, ctl, |w| {
+                    save::write_replaced(&input, &matcher, &with, w, ctl)
+                })
+                .map_err(|e| e.to_string())
+            },
+        ));
+    }
+
+    /// Starts an export to `target`.
+    pub fn start_export(
+        &mut self,
+        scope: Scope,
+        opts: ExportOptions,
+        header: bool,
+        target: PathBuf,
+        open: bool,
+        notify: Notify,
+    ) {
+        let header = if header {
+            self.doc.header_record().ok().flatten().map(|h| h.start)
+        } else {
+            None
+        };
+        let input = ExportInput {
+            target: self.doc.target(),
+            locator: self.doc.job_locator(),
+            overlay: self.doc.overlay.snapshot(),
+            header,
+            columns: self.info.columns.max(1),
+            rows: self.doc.stats().rows,
+        };
+        let t = target.clone();
+        self.export = Some(SaveJob::spawn(
+            "export",
+            WriteKind::Export { open },
+            target,
+            notify,
+            move |ctl| export::export(input, scope, &opts, &t, ctl).map_err(|e| e.to_string()),
+        ));
     }
 
     /// Makes the tab show `path` (after Save As).

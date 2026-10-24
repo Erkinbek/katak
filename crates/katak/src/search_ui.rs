@@ -1,9 +1,13 @@
-//! The search bar (Ctrl+F), F3 navigation and the results panel.
+//! The search bar (Ctrl+F), Replace (Ctrl+H), F3 navigation and the
+//! results panel.
+
+use std::sync::Arc;
 
 use eframe::egui::{self, Key, RichText};
 use katak_core::job::Notify;
 use katak_core::locate::RowPos;
-use katak_core::search::{self, Hit, Search, SearchOptions};
+use katak_core::replace::{self, ReplacePlan};
+use katak_core::search::{self, Hit, Matcher, Search, SearchOptions};
 
 use crate::grid::{GridCommand, group};
 use crate::tab::Tab;
@@ -27,7 +31,28 @@ pub struct SearchBar {
     /// Jump to the first hit after the cursor once results arrive.
     pending_jump: Option<bool>,
     pub selected: Option<usize>,
+    /// The Replace row is shown.
+    pub replace: bool,
+    pub with: String,
+    focus_with: bool,
+    /// A running Replace All.
+    pub plan: Option<ReplacePlan>,
+    plan_generation: u64,
 }
+
+/// What a finished Replace All asks of the app.
+pub enum ReplaceOutcome {
+    Message(String),
+    /// More cells match than edits are kept for: offer a rewrite of the
+    /// file instead.
+    TooMany {
+        matcher: Arc<Matcher>,
+        with: String,
+    },
+}
+
+/// Largest cell "Replace" edits in place.
+const MAX_REPLACE_CELL: usize = 16 << 20;
 
 impl SearchBar {
     fn options(&self, cursor_col: usize) -> SearchOptions {
@@ -44,6 +69,17 @@ impl SearchBar {
     pub fn open(&mut self) {
         self.open = true;
         self.focus = true;
+    }
+
+    /// Ctrl+H: the search bar with the Replace row.
+    pub fn open_replace(&mut self) {
+        self.open = true;
+        self.replace = true;
+        if self.query.is_empty() {
+            self.focus = true;
+        } else {
+            self.focus_with = true;
+        }
     }
 
     pub fn close(&mut self) {
@@ -129,6 +165,108 @@ fn go_to_hit(tab: &mut Tab, h: Hit) {
     tab.search.selected = index;
 }
 
+/// "Replace": replaces the matches in the cursor's cell, then moves to
+/// the next match. When the cursor's cell does not match, it only moves.
+pub fn replace_current(tab: &mut Tab, notify: &Notify) -> Option<String> {
+    let opts = tab.search.options(tab.info.cursor_col);
+    if opts.pattern.is_empty() {
+        return None;
+    }
+    if tab.grid.read_only || tab.save.is_some() {
+        return Some("The file is read-only or being saved.".into());
+    }
+    let matcher = match Matcher::new(&opts) {
+        Ok(m) => m,
+        Err(e) => {
+            tab.search.error = Some(e);
+            return None;
+        }
+    };
+    let col = tab.grid.cursor_col;
+    if let Some(row) = tab.grid.current_row(&mut tab.doc)
+        && matcher.wants_column(col)
+        && let Ok(value) = tab.doc.value(&row, col, MAX_REPLACE_CELL + 1)
+    {
+        if value.len() > MAX_REPLACE_CELL {
+            return Some("This cell is too large to edit here.".into());
+        }
+        if matcher.is_match(&value) {
+            let new = matcher.replace(&value, &tab.search.with, true);
+            if new != value {
+                let new = new.into_owned();
+                tab.doc.set_values(vec![(row.row_ref(), col, new)]);
+            }
+        }
+    }
+    jump(tab, true, notify);
+    None
+}
+
+/// "Replace all": plans the replacement in the background.
+pub fn replace_all(tab: &mut Tab, notify: &Notify) -> Option<String> {
+    let opts = tab.search.options(tab.info.cursor_col);
+    if opts.pattern.is_empty() {
+        return None;
+    }
+    if tab.grid.read_only || tab.save.is_some() {
+        return Some("The file is read-only or being saved.".into());
+    }
+    match replace::plan(
+        tab.doc.target(),
+        opts,
+        tab.search.with.clone(),
+        replace::DEFAULT_THRESHOLD,
+        notify.clone(),
+    ) {
+        Ok(p) => {
+            tab.search.plan = Some(p);
+            tab.search.plan_generation = tab.doc.generation();
+            tab.search.error = None;
+        }
+        Err(e) => tab.search.error = Some(e),
+    }
+    None
+}
+
+/// Applies a finished Replace All plan.
+pub fn poll_replace(tab: &mut Tab) -> Option<ReplaceOutcome> {
+    if tab.search.plan.as_ref()?.job.is_running() {
+        return None;
+    }
+    let plan = tab.search.plan.take()?;
+    if tab.search.plan_generation != tab.doc.generation() {
+        return None;
+    }
+    let mut d = plan.data.lock();
+    if let Some(e) = d.error.take().or_else(|| plan.job.error()) {
+        return Some(ReplaceOutcome::Message(e));
+    }
+    if !d.done {
+        return Some(ReplaceOutcome::Message(
+            "Replace All was cancelled; nothing was changed.".into(),
+        ));
+    }
+    if d.over {
+        return Some(ReplaceOutcome::TooMany {
+            matcher: plan.matcher.clone(),
+            with: plan.with.clone(),
+        });
+    }
+    let edits = std::mem::take(&mut d.edits);
+    drop(d);
+    if edits.is_empty() {
+        return Some(ReplaceOutcome::Message("Nothing to replace.".into()));
+    }
+    let n = edits.len() as u64;
+    tab.doc.set_changed_values(edits);
+    // The hit list describes the old values.
+    tab.search.reset();
+    Some(ReplaceOutcome::Message(format!(
+        "Replaced {} cells. Ctrl+Z undoes it.",
+        group(n)
+    )))
+}
+
 /// Per-frame housekeeping: invalidation and pending jumps.
 pub fn tick(tab: &mut Tab, notify: &Notify) {
     if tab.search.run.is_some() && tab.search.generation != tab.doc.generation() {
@@ -151,7 +289,7 @@ pub fn tick(tab: &mut Tab, notify: &Notify) {
 }
 
 /// The search bar.
-pub fn bar(ui: &mut egui::Ui, tab: &mut Tab, notify: &Notify) {
+pub fn bar(ui: &mut egui::Ui, tab: &mut Tab, notify: &Notify, messages: &mut Vec<String>) {
     ui.horizontal(|ui| {
         ui.label("Find");
         let edit = egui::TextEdit::singleline(&mut tab.search.query)
@@ -228,7 +366,69 @@ pub fn bar(ui: &mut egui::Ui, tab: &mut Tab, notify: &Notify) {
             if ui.small_button("×").on_hover_text("Close (Esc)").clicked() {
                 tab.search.close();
             }
+            ui.toggle_value(&mut tab.search.replace, "Replace")
+                .on_hover_text("Show the Replace row (Ctrl+H)");
         });
+    });
+    if tab.search.replace {
+        replace_row(ui, tab, notify, messages);
+    }
+}
+
+fn replace_row(ui: &mut egui::Ui, tab: &mut Tab, notify: &Notify, messages: &mut Vec<String>) {
+    ui.horizontal(|ui| {
+        ui.label("Replace");
+        let hint = if tab.search.regex {
+            "replacement ($1, ${name} for groups)"
+        } else {
+            "replacement"
+        };
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut tab.search.with)
+                .desired_width(280.0)
+                .hint_text(hint),
+        );
+        if tab.search.focus_with {
+            r.request_focus();
+            tab.search.focus_with = false;
+        }
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let busy = tab.search.plan.is_some();
+        if ui
+            .add_enabled(!busy, egui::Button::new("Replace"))
+            .on_hover_text("Replace in the cursor's cell, then go to the next match")
+            .clicked()
+            || (enter && !busy)
+        {
+            messages.extend(replace_current(tab, notify));
+            if enter {
+                r.request_focus();
+            }
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new("Replace all"))
+            .on_hover_text(format!(
+                "Up to {} cells become one undoable edit; more rewrite the file",
+                group(replace::DEFAULT_THRESHOLD as u64)
+            ))
+            .clicked()
+        {
+            messages.extend(replace_all(tab, notify));
+        }
+        if let Some(p) = &tab.search.plan {
+            let n = p.data.lock().edits.len();
+            ui.add(
+                egui::ProgressBar::new(p.job.fraction())
+                    .desired_width(90.0)
+                    .text(format!("{:.0}%", p.job.fraction() * 100.0)),
+            );
+            ui.label(format!("{} cells to replace so far", group(n as u64)));
+            if ui.button("Cancel").clicked() {
+                p.job.cancel();
+            }
+        } else if tab.search.regex {
+            ui.weak("$1 or ${name} insert groups; $$ is a literal $");
+        }
     });
 }
 

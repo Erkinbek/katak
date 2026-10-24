@@ -15,7 +15,7 @@ use eframe::egui::{
 };
 use eframe::epaint::text::{LayoutJob, TextFormat, TextWrapping};
 use katak_core::document::{Cell, Document};
-use katak_core::filter::{Row, SharedFilter};
+use katak_core::filter::{FilterData, Row, SharedFilter};
 use katak_core::infer::{self, ColumnType};
 use katak_core::locate::{FetchEnd, RowPos};
 use katak_core::logical::{LKind, LPos, LRow};
@@ -212,6 +212,10 @@ pub struct GridInfo {
     pub filter_column: Option<usize>,
     /// "Rename column" was chosen in the header menu.
     pub rename_column: Option<usize>,
+    /// "Sort ascending/descending" was chosen: (column, descending).
+    pub sort: Option<(usize, bool)>,
+    /// "Clear sort" was chosen.
+    pub clear_sort: bool,
     /// Text to put on the clipboard.
     pub copy: Option<String>,
     /// A large copy waiting for confirmation.
@@ -226,8 +230,47 @@ pub enum View {
     /// Every row in order.
     #[default]
     Natural,
-    /// The rows of a (possibly still running) filter, in file order.
+    /// The rows of a filter (file order, possibly still running) or of a
+    /// sort (sort order).
     List(SharedFilter),
+}
+
+/// The selection (or the cursor cell), for Export.
+#[derive(Clone, Copy, Debug)]
+pub struct Selection {
+    /// Position of the first selected row.
+    pub start: LPos,
+    /// First row index: logical row number, or list index in a list view.
+    pub first: u64,
+    pub rows: u64,
+    /// Inclusive column range.
+    pub cols: (usize, usize),
+}
+
+/// Index of the listed row with the smallest key at or after `target`, or
+/// with the largest key when there is none. Lists in file order are
+/// bisected; sort permutations are scanned (on explicit jumps only).
+fn list_find(d: &FilterData, key: fn(&Row) -> u64, target: u64) -> usize {
+    let n = d.rows.len();
+    if !d.sorted {
+        return d
+            .rows
+            .partition_point(|r| key(r) < target)
+            .min(n.saturating_sub(1));
+    }
+    let mut after: Option<(u64, usize)> = None;
+    let mut before: Option<(u64, usize)> = None;
+    for (i, r) in d.rows.iter().enumerate() {
+        let k = key(&r);
+        if k >= target {
+            if after.is_none_or(|(b, _)| k < b) {
+                after = Some((k, i));
+            }
+        } else if before.is_none_or(|(b, _)| k > b) {
+            before = Some((k, i));
+        }
+    }
+    after.or(before).map_or(0, |(_, i)| i)
 }
 
 /// A row on screen.
@@ -288,6 +331,8 @@ pub struct Grid {
     lcur: usize,
     /// Search matches are highlighted in visible cells.
     pub highlight: Option<Arc<Matcher>>,
+    /// The sorted column and direction (descending), marked in the header.
+    pub sort_mark: Option<(usize, bool)>,
     pub read_only: bool,
     editor: Option<Editor>,
     actions: Vec<EditAction>,
@@ -332,6 +377,7 @@ impl Grid {
             ltop: 0,
             lcur: 0,
             highlight: None,
+            sort_mark: None,
             read_only: false,
             editor: None,
             actions: Vec::new(),
@@ -377,12 +423,10 @@ impl Grid {
         self.ltop = 0;
         self.lcur = 0;
         if let Some(l) = self.list() {
+            // A filter keeps the cursor near its row; a sort starts at the top.
             let d = l.lock();
-            if !d.rows.is_empty() {
-                self.lcur = d
-                    .rows
-                    .partition_point(|r| r.offset < cursor.rec.offset)
-                    .min(d.rows.len() - 1);
+            if !d.rows.is_empty() && !d.sorted {
+                self.lcur = list_find(&d, |r| r.offset, cursor.rec.offset);
                 self.ltop = self.lcur;
             }
         } else {
@@ -394,7 +438,8 @@ impl Grid {
         matches!(self.view, View::List(_))
     }
 
-    fn list(&self) -> Option<SharedFilter> {
+    /// The row list shown (filter or sort), if any.
+    pub fn list(&self) -> Option<SharedFilter> {
         match &self.view {
             View::List(l) => Some(l.clone()),
             View::Natural => None,
@@ -509,10 +554,7 @@ impl Grid {
         if let Some(l) = self.list() {
             let d = l.lock();
             if !d.rows.is_empty() {
-                self.lcur = d
-                    .rows
-                    .partition_point(|r| r.offset < pos.rec.offset)
-                    .min(d.rows.len() - 1);
+                self.lcur = list_find(&d, |r| r.offset, pos.rec.offset);
                 self.ltop = self.lcur.saturating_sub(visible / 3);
                 self.top_px = 0.0;
             }
@@ -574,19 +616,18 @@ impl Grid {
             return positional;
         }
         let page = visible.saturating_sub(1).max(1);
-        let find = |pred: &dyn Fn(&Row) -> bool| l.lock().rows.partition_point(pred).min(n - 1);
+        let find = |key: fn(&Row) -> u64, target: u64| list_find(&l.lock(), key, target);
         let (top, cur) = match c {
             GridCommand::GotoRow(row) => {
-                let rec = row + doc.header_records();
-                let i = find(&|r| r.record < rec);
+                let i = find(|r| r.record, row + doc.header_records());
                 (i.saturating_sub(visible / 3), i)
             }
             GridCommand::GotoOffset(off) => {
-                let i = find(&|r| r.offset < off);
+                let i = find(|r| r.offset, off);
                 (i.saturating_sub(visible / 3), i)
             }
             GridCommand::GotoRecord(p) => {
-                let i = find(&|r| r.offset < p.offset);
+                let i = find(|r| r.offset, p.offset);
                 (i.saturating_sub(visible / 3), i)
             }
             GridCommand::Top => (0, 0),
@@ -792,6 +833,22 @@ impl Grid {
         )
     }
 
+    /// The selection (or the cursor cell).
+    pub fn selection(&self) -> Selection {
+        let (r0, r1, c0, c1) = self.selection_box();
+        let c = self.cursor_mark();
+        let start = match self.anchor {
+            Some(a) if a.index < c.index => a.pos,
+            _ => c.pos,
+        };
+        Selection {
+            start,
+            first: r0,
+            rows: r1 - r0 + 1,
+            cols: (c0, c1),
+        }
+    }
+
     /// The rows of the selection (bounded by `max`).
     fn selected_rows(&mut self, doc: &mut Document, max: u64) -> Result<Vec<LRow>, String> {
         let (r0, r1, _, _) = self.selection_box();
@@ -843,7 +900,7 @@ impl Grid {
 
     /// The row under the cursor (from its position, not from the rows of
     /// the last frame, which may be stale after an edit action).
-    fn current_row(&mut self, doc: &mut Document) -> Option<LRow> {
+    pub fn current_row(&mut self, doc: &mut Document) -> Option<LRow> {
         if let Some(l) = self.list() {
             let r = l.lock().rows.get(self.lcur)?;
             let rp = RowPos {
@@ -1075,7 +1132,7 @@ impl Grid {
             }
             EditAction::InsertRowAbove | EditAction::InsertRowBelow => {
                 if self.is_list() {
-                    return Err("Clear the filter to insert rows.".into());
+                    return Err("Clear the filter and the sort to insert rows.".into());
                 }
                 let below = matches!(a, EditAction::InsertRowBelow);
                 let here = self.current_row(doc).map(|r| r.pos).unwrap_or(self.cursor);
@@ -1511,12 +1568,28 @@ impl Grid {
                 .column_name(c)
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| format!("Column {}", c + 1));
+            let sorted = self.sort_mark.filter(|m| m.0 == c).map(|m| m.1);
+            let mark_w = if sorted.is_some() { 12.0 } else { 0.0 };
             let job = single_line(
                 &name,
                 header_font.clone(),
                 colors.header_text,
-                w - 2.0 * CELL_PAD,
+                w - 2.0 * CELL_PAD - mark_w,
             );
+            if let Some(descending) = sorted {
+                // A small triangle: apex up for ascending, down for descending.
+                let (cx, cy) = (rect.right() - CELL_PAD - 4.0, rect.center().y);
+                let (base, apex) = if descending {
+                    (cy - 2.5, cy + 2.5)
+                } else {
+                    (cy + 2.5, cy - 2.5)
+                };
+                header_painter.add(egui::Shape::convex_polygon(
+                    vec![pos2(cx - 4.0, base), pos2(cx + 4.0, base), pos2(cx, apex)],
+                    colors.header_text,
+                    Stroke::NONE,
+                ));
+            }
             let galley = header_painter.layout_job(job);
             header_painter.galley(
                 pos2(
@@ -1867,6 +1940,29 @@ impl Grid {
             });
         });
         ui.separator();
+        let how = match self.cols.kind(c) {
+            ColumnType::Integer | ColumnType::Float => "numbers",
+            ColumnType::Date => "dates",
+            ColumnType::Text => "text",
+        };
+        if ui
+            .button(format!("Sort ascending ({how})"))
+            .on_hover_text(
+                "Shows the rows sorted; the file is not changed. Export writes them in this order.",
+            )
+            .clicked()
+        {
+            self.out.sort = Some((c, false));
+            ui.close();
+        }
+        if ui.button(format!("Sort descending ({how})")).clicked() {
+            self.out.sort = Some((c, true));
+            ui.close();
+        }
+        if self.sort_mark.is_some() && ui.button("Clear sort").clicked() {
+            self.out.clear_sort = true;
+            ui.close();
+        }
         if ui.button("Filter this column…").clicked() {
             self.out.filter_column = Some(c);
             ui.close();
