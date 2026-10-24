@@ -7,6 +7,7 @@
 pub mod dialect;
 pub mod encoding;
 pub mod fields;
+pub mod index;
 pub mod job;
 pub mod scan;
 pub mod source;
