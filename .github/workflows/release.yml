@@ -76,8 +76,13 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/katak.exe" "dist/katak-${{ matrix.name }}.exe"
           else
+            bin="target/${{ matrix.target }}/release/katak"
+            # The line tables kept for backtraces make the Linux executable
+            # ~78 MB (macOS keeps them outside the executable). Function
+            # names stay.
+            if [ "${{ runner.os }}" = "Linux" ]; then strip --strip-debug "$bin"; fi
             mkdir -p "pkg/katak"
-            cp "target/${{ matrix.target }}/release/katak" README.md LICENSE pkg/katak/
+            cp "$bin" README.md LICENSE pkg/katak/
             tar -C pkg -czf "dist/katak-${{ matrix.name }}.tar.gz" katak
           fi
 
