@@ -15,12 +15,14 @@ pub mod index;
 pub mod infer;
 pub mod job;
 pub mod locate;
+pub mod overlay;
 pub mod scan;
 pub mod search;
 pub mod source;
 pub mod sys;
 pub mod units;
 pub mod visit;
+pub mod write;
 
 pub use dialect::{Compiled, Delimiter, Dialect, DialectError, Escape};
 pub use encoding::TextEncoding;
