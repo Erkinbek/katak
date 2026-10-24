@@ -306,9 +306,9 @@ fn utf16_pattern(sample: &[u8]) -> Option<TextEncoding> {
     }
     let pairs = n / 2;
     let (mut even_zero, mut odd_zero) = (0usize, 0usize);
-    for pair in sample[..n].chunks_exact(2) {
-        even_zero += (pair[0] == 0) as usize;
-        odd_zero += (pair[1] == 0) as usize;
+    for &[even, odd] in sample[..n].as_chunks::<2>().0 {
+        even_zero += (even == 0) as usize;
+        odd_zero += (odd == 0) as usize;
     }
     let (hi, lo) = (pairs * 3 / 10, pairs / 50);
     if odd_zero >= hi && even_zero <= lo {
