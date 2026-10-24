@@ -1,0 +1,7 @@
+# Normalize all text to LF in the repository and working tree.
+* text=auto eol=lf
+
+# Test fixtures intentionally contain CRLF/CR/mixed line endings, UTF-16 and
+# raw bytes. Git must never rewrite them, or the tests lie.
+/testdata/fixtures/** -text -diff
+*.bin -text -diff

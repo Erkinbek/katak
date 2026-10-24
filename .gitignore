@@ -1,0 +1,20 @@
+# Build output
+/target
+
+# Generated test data (multi-GB, produced by tools/katak-gen)
+/testdata/generated/
+
+# Backups and temp files (Katak writes *.bak and .*.katak-*.tmp)
+*.bak
+*.tmp
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
