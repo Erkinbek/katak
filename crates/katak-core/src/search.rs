@@ -15,11 +15,13 @@ use regex::Regex;
 use crate::chunked::ChunkedVec;
 use crate::dialect::Compiled;
 use crate::encoding::TextEncoding;
-use crate::fields::{split, unquote};
+use crate::fields::{FieldSpan, split, unquote};
 use crate::job::{Job, Notify};
+use crate::overlay::{ColRef, Overlay, RowRef};
 use crate::scan::Flow;
 use crate::source::Source;
 use crate::visit::{Prefilter, visit_records};
+use std::borrow::Cow;
 
 /// Results kept by default; more are counted as "more exist".
 pub const DEFAULT_CAP: usize = 1_000_000;
@@ -211,6 +213,90 @@ pub struct Target {
     pub data_start: u64,
     /// Records before the first data row (the header is not searched).
     pub header_records: u64,
+    /// Unsaved edits to take into account (deleted rows are skipped, edited
+    /// cells are matched on their new values).
+    pub overlay: Option<Arc<Overlay>>,
+}
+
+impl Target {
+    /// Offsets of records with edits, for [`visit_records`]'s `forced`.
+    pub(crate) fn forced(&self) -> Vec<u64> {
+        self.overlay
+            .as_ref()
+            .map(|o| o.edited_offsets().collect())
+            .unwrap_or_default()
+    }
+
+    /// Is the record at `offset` deleted?
+    pub(crate) fn deleted(&self, offset: u64) -> bool {
+        self.overlay.as_ref().is_some_and(|o| o.is_deleted(offset))
+    }
+
+    /// The values of a record in logical column order, with edits applied.
+    /// `spans` must hold all fields of `content`.
+    pub(crate) fn values<'a>(
+        &self,
+        offset: u64,
+        content: &'a [u8],
+        spans: &[FieldSpan],
+    ) -> Vec<(usize, Cow<'a, str>)> {
+        let raw = |i: usize| -> Cow<'a, str> {
+            match spans.get(i) {
+                Some(f) => match unquote(&self.dialect, &content[f.start..f.end], f.quoted) {
+                    Cow::Borrowed(b) => self.encoding.decode(b),
+                    Cow::Owned(v) => Cow::Owned(self.encoding.decode(&v).into_owned()),
+                },
+                None => Cow::Borrowed(""),
+            }
+        };
+        let ov = match &self.overlay {
+            Some(ov) if ov.row_edits(offset).is_some() || ov.columns().is_some() => ov,
+            _ => return (0..spans.len()).map(|i| (i, raw(i))).collect(),
+        };
+        let n = match ov.columns() {
+            Some(cols) => {
+                let mapped = cols
+                    .iter()
+                    .filter_map(|c| {
+                        if let ColRef::Src(i) = c {
+                            Some(*i as usize + 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                cols.len() + spans.len().saturating_sub(mapped)
+            }
+            None => {
+                let edited = ov
+                    .row_edits(offset)
+                    .into_iter()
+                    .flat_map(|e| e.keys())
+                    .filter_map(|c| {
+                        if let ColRef::Src(i) = c {
+                            Some(*i as usize + 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                spans.len().max(edited)
+            }
+        };
+        (0..n)
+            .map(|c| {
+                let cref = ov.col_ref(c);
+                let v = match (ov.cell(RowRef::Src(offset), cref), cref) {
+                    (Some(e), _) => Cow::Owned(e.to_string()),
+                    (None, ColRef::Src(i)) => raw(i as usize),
+                    (None, ColRef::New(_)) => Cow::Borrowed(""),
+                };
+                (c, v)
+            })
+            .collect()
+    }
 }
 
 /// Starts a search job. Fails only for an invalid regex.
@@ -235,6 +321,12 @@ pub fn start(
             d.records_scanned = records;
             d.capped |= capped;
         };
+        let forced = target.forced();
+        let fields = if target.overlay.is_some() {
+            usize::MAX
+        } else {
+            m.fields_needed()
+        };
         let res = visit_records(
             &target.src,
             &target.dialect,
@@ -242,18 +334,17 @@ pub fn start(
             0,
             ctl,
             pre.as_ref(),
+            &forced,
             |v| {
-                if v.record < target.header_records {
+                if v.record < target.header_records || target.deleted(v.span.start) {
                     return Flow::Continue;
                 }
                 spans.clear();
-                split(&target.dialect, v.content, 0, m.fields_needed(), &mut spans);
-                for (c, f) in spans.iter().enumerate() {
+                split(&target.dialect, v.content, 0, fields, &mut spans);
+                for (c, text) in target.values(v.span.start, v.content, &spans) {
                     if !m.wants_column(c) {
                         continue;
                     }
-                    let raw = unquote(&target.dialect, &v.content[f.start..f.end], f.quoted);
-                    let text = target.encoding.decode(&raw);
                     if m.is_match(&text) {
                         if found >= cap {
                             flush(&mut batch, v.record, true);
@@ -406,6 +497,7 @@ mod tests {
             encoding: d.encoding,
             data_start: 0,
             header_records: d.has_header as u64,
+            overlay: None,
         };
         let s = start(target, o, cap, no_notify()).unwrap();
         s.job.join();
@@ -488,6 +580,48 @@ mod tests {
                 "{enc:?}"
             );
         }
+    }
+
+    #[test]
+    fn search_sees_unsaved_edits() {
+        use crate::overlay::{Deleted, Overlay};
+        let data = b"h\nalpha\nbeta\nneedle here\n";
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.csv");
+        std::fs::write(&p, data).unwrap();
+        let d = Dialect::default();
+        let offs: Vec<u64> = crate::scan::scan_all(&d.compile().unwrap(), data, 0, usize::MAX)
+            .iter()
+            .map(|r| r.start)
+            .collect();
+        let mut ov = Overlay::new();
+        ov.set_cells(
+            vec![(RowRef::Src(offs[2]), ColRef::Src(0), "a needle".into())],
+            |_, _| None,
+        );
+        ov.delete_rows(
+            &[],
+            &[Deleted {
+                start: offs[3],
+                end: data.len() as u64,
+                records: 1,
+            }],
+        );
+        let target = Target {
+            src: Arc::new(Source::open(&p, AccessMode::Auto).unwrap()),
+            dialect: Arc::new(d.compile().unwrap()),
+            encoding: d.encoding,
+            data_start: 0,
+            header_records: 1,
+            overlay: Some(Arc::new(ov)),
+        };
+        let s = start(target, opts("needle"), 100, no_notify()).unwrap();
+        s.job.join();
+        let hits = s.data.lock().hits.slice(0, 10);
+        assert_eq!(
+            hits.iter().map(|h| h.offset).collect::<Vec<_>>(),
+            vec![offs[2]]
+        );
     }
 
     #[test]

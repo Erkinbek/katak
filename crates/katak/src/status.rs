@@ -16,10 +16,9 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
     let d = tab.doc.dialect();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let hdr = tab.doc.header_records();
-        if let Some(c) = tab.info.cursor {
-            let n = c.record.saturating_sub(hdr) + 1;
-            let row = if c.exact {
+        if tab.info.cursor.is_some() {
+            let n = tab.info.cursor_row + 1;
+            let row = if tab.info.cursor_exact {
                 format!("Row {}", group(n))
             } else {
                 format!("Row ~{}", group(n))
@@ -76,6 +75,32 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
                 "Rows whose field count differs from the first row. F8 jumps to the next one.",
             );
         }
+        if tab.dirty() {
+            sep(ui);
+            let ov = &tab.doc.overlay;
+            let mut parts = Vec::new();
+            if ov.edited_cells() > 0 {
+                parts.push(format!("{} cells edited", group(ov.edited_cells() as u64)));
+            }
+            if ov.inserted_rows() > 0 {
+                parts.push(format!("+{} rows", group(ov.inserted_rows() as u64)));
+            }
+            if ov.deleted_records() > 0 {
+                parts.push(format!("−{} rows", group(ov.deleted_records())));
+            }
+            if ov.columns().is_some() {
+                parts.push("columns changed".into());
+            }
+            ui.label(
+                RichText::new(format!("Unsaved: {}", parts.join(", ")))
+                    .color(egui::Color32::from_rgb(0x3C, 0xC4, 0x7A)),
+            )
+            .on_hover_text("Ctrl+S saves; Edit → Discard all edits drops them.");
+        }
+        if tab.grid.read_only {
+            sep(ui);
+            ui.label("Read-only");
+        }
         if !tab.doc.source().is_mapped() {
             sep(ui);
             ui.label("Buffered").on_hover_text(
@@ -86,6 +111,13 @@ pub fn show(ui: &mut egui::Ui, tab: &Tab, stats: &DocStats, column_name: Option<
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(s) = &tab.save {
+                ui.add(
+                    egui::ProgressBar::new(s.job.fraction())
+                        .desired_width(120.0)
+                        .text(format!("Saving {:.0}%", s.job.fraction() * 100.0)),
+                );
+            }
             if stats.indexing {
                 let secs = stats.index_elapsed.as_secs_f64().max(1e-3);
                 let rate = stats.index_bytes as f64 / secs / (1 << 20) as f64;

@@ -79,6 +79,8 @@ struct State {
     scratch: Vec<u8>,
     stop: bool,
     error: Option<io::Error>,
+    /// Cursor into the forced offsets.
+    forced: usize,
 }
 
 struct VisitSink<'w, 'f, F> {
@@ -86,6 +88,7 @@ struct VisitSink<'w, 'f, F> {
     base: u64,
     src: &'w Source,
     pre: Option<&'w Prefilter>,
+    forced: &'w [u64],
     st: &'w mut State,
     f: &'f mut F,
 }
@@ -96,7 +99,12 @@ impl<F: FnMut(&Visit) -> Flow> Sink for VisitSink<'_, '_, F> {
         self.st.records += 1;
         let win_end = self.base + self.win.len() as u64;
         let in_window = r.start >= self.base;
-        if let (Some(pre), false) = (self.pre, r.escaped) {
+        // Records the caller must see regardless of their raw bytes.
+        while self.st.forced < self.forced.len() && self.forced[self.st.forced] < r.start {
+            self.st.forced += 1;
+        }
+        let forced = self.forced.get(self.st.forced) == Some(&r.start);
+        if let (Some(pre), false, false) = (self.pre, r.escaped, forced) {
             if r.content_end <= self.st.clear_until {
                 return Flow::Continue;
             }
@@ -152,7 +160,9 @@ impl<F: FnMut(&Visit) -> Flow> Sink for VisitSink<'_, '_, F> {
 
 /// Visits the records starting at `start` (a record start whose number is
 /// `first_record`) in file order, until the end, a `Stop` from `f`, or
-/// cancellation. Reports byte progress to `ctl`.
+/// cancellation. Reports byte progress to `ctl`. Records starting at an
+/// offset in `forced` (sorted) bypass the prefilter.
+#[allow(clippy::too_many_arguments)]
 pub fn visit_records<F>(
     src: &Source,
     d: &Compiled,
@@ -160,6 +170,7 @@ pub fn visit_records<F>(
     first_record: u64,
     ctl: &JobCtl,
     pre: Option<&Prefilter>,
+    forced: &[u64],
     mut f: F,
 ) -> io::Result<Outcome>
 where
@@ -173,6 +184,7 @@ where
         scratch: Vec::new(),
         stop: false,
         error: None,
+        forced: 0,
     };
     let mut scanner = Scanner::new(d, start);
     let mut reader = ChunkReader::new(src, src.len(), CHUNK);
@@ -190,6 +202,7 @@ where
             base: w.base,
             src,
             pre,
+            forced,
             st: &mut st,
             f: &mut f,
         };
@@ -227,7 +240,7 @@ mod tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let o2 = out.clone();
         let job = Job::spawn("visit", no_notify(), move |ctl| {
-            visit_records(&src, &d, 0, 0, ctl, pre.as_ref(), |v| {
+            visit_records(&src, &d, 0, 0, ctl, pre.as_ref(), &[], |v| {
                 o2.lock().unwrap().push((v.record, v.content.to_vec()));
                 Flow::Continue
             })

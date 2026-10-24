@@ -17,7 +17,10 @@ use crate::dialect::{Compiled, Dialect, DialectError};
 use crate::fields::{FieldSpan, field_text, split, visible};
 use crate::index::{self, Index, IndexWarning, LineEndings};
 use crate::job::{Job, Notify};
-use crate::locate::{Locator, RowPos};
+use crate::locate::{FetchEnd, Locator, RowPos};
+use crate::logical::{self, LKind, LPos, LRow};
+use crate::overlay::{ColRef, END, Overlay, RowRef};
+use crate::save::SaveInput;
 use crate::scan::{RecSpan, scan_all};
 use crate::source::{AccessMode, ChunkReader, Source};
 use crate::units::{CR, LF, Units};
@@ -101,6 +104,9 @@ pub struct Document {
     opened: Instant,
     /// Average record size in the sample (estimates before indexing).
     sample_avg: Option<f64>,
+    access: AccessMode,
+    /// Unsaved changes.
+    pub overlay: Overlay,
 }
 
 /// Errors when opening a document.
@@ -143,14 +149,18 @@ impl Document {
             generation: 0,
             opened: Instant::now(),
             sample_avg: None,
+            access: opts.access,
+            overlay: Overlay::new(),
         };
         doc.restart_index();
         Ok(doc)
     }
 
-    /// Switches to new parsing options: the index is discarded and rebuilt.
+    /// Switches to new parsing options: the index is discarded and rebuilt,
+    /// and unsaved edits are dropped (record offsets change meaning).
     pub fn set_dialect(&mut self, dialect: Dialect) -> Result<(), OpenError> {
         let compiled = Arc::new(dialect.compile()?);
+        self.overlay.clear();
         self.data_start = data_start_for(&self.source, &self.sample, &dialect)?;
         self.dialect = dialect;
         self.compiled = compiled;
@@ -268,6 +278,7 @@ impl Document {
             encoding: self.dialect.encoding,
             data_start: self.data_start,
             header_records: self.header_records(),
+            overlay: (!self.overlay.is_empty()).then(|| self.overlay.snapshot()),
         }
     }
 
@@ -459,6 +470,233 @@ impl Document {
     /// the caller should repaint soon.
     pub fn cells_pending(&self) -> bool {
         self.fields_pending
+    }
+
+    // ------------------------------------------------------- overlay
+
+    /// Re-reads the file after it was saved (or changed on disk): same
+    /// dialect, no edits, fresh index.
+    pub fn reopen(&mut self) -> Result<(), OpenError> {
+        let path = self.source.path().to_path_buf();
+        let source = Arc::new(Source::open(&path, self.access)?);
+        let n = (source.len() as usize).min(SAMPLE_BYTES);
+        let mut sample = vec![0u8; n];
+        source.read_at(0, &mut sample)?;
+        self.data_start = data_start_for(&source, &sample, &self.dialect)?;
+        self.source = source;
+        self.sample = sample.into();
+        self.overlay.clear();
+        self.generation += 1;
+        self.restart_index();
+        Ok(())
+    }
+
+    /// Everything a save job needs (a snapshot of the overlay).
+    pub fn save_input(&self, columns: usize) -> SaveInput {
+        let line_ending = self
+            .index
+            .read()
+            .line_endings
+            .dominant()
+            .or(self.detection.line_endings.dominant())
+            .unwrap_or(crate::scan::Term::Lf);
+        SaveInput {
+            src: self.source.clone(),
+            dialect: self.dialect.clone(),
+            compiled: self.compiled.clone(),
+            data_start: self.data_start,
+            overlay: self.overlay.snapshot(),
+            line_ending,
+            columns,
+        }
+    }
+
+    /// Position of the first data row.
+    pub fn first_lpos(&mut self) -> LPos {
+        let rec = self.first_data_row().unwrap_or(RowPos {
+            offset: self.data_start,
+            record: 0,
+            exact: true,
+        });
+        // Rows inserted before the first record come first.
+        LPos { rec, sub: 0 }
+    }
+
+    /// Position after the last row.
+    pub fn end_lpos(&mut self) -> LPos {
+        let rec = self.locator.end_pos();
+        LPos {
+            rec,
+            sub: self.overlay.inserted_before(END).len() as u32,
+        }
+    }
+
+    /// The logical position of a source record.
+    pub fn lpos_of(&self, rec: RowPos) -> LPos {
+        logical::at_record(&self.overlay, rec, self.source.len())
+    }
+
+    pub fn lrows_from(&mut self, from: LPos, n: usize) -> io::Result<(Vec<LRow>, FetchEnd)> {
+        logical::rows_from(&mut self.locator, &self.overlay, from, n)
+    }
+
+    pub fn lrows_before(&mut self, before: LPos, n: usize) -> io::Result<Vec<LRow>> {
+        let hdr = self.header_records();
+        logical::rows_before(&mut self.locator, &self.overlay, before, n, hdr)
+    }
+
+    /// Logical data-row index (0-based) of a position.
+    pub fn lnumber(&self, pos: &LPos) -> u64 {
+        logical::number(&self.overlay, pos, self.header_records(), self.source.len())
+    }
+
+    /// Number of logical columns, given the source columns known so far.
+    pub fn logical_columns(&self, source_columns: usize) -> usize {
+        match self.overlay.columns() {
+            None => source_columns,
+            Some(cols) => {
+                let mapped = cols
+                    .iter()
+                    .filter_map(|c| {
+                        if let ColRef::Src(i) = c {
+                            Some(*i as usize + 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                cols.len() + source_columns.saturating_sub(mapped)
+            }
+        }
+    }
+
+    /// Cells `cols` (logical columns) of a logical row, with edits applied.
+    /// The flag tells whether the cell was edited.
+    pub fn display_cells(
+        &mut self,
+        row: &LRow,
+        cols: Range<usize>,
+        max_chars: usize,
+    ) -> io::Result<Vec<(Cell, bool)>> {
+        let rref = row.row_ref();
+        let mut out = Vec::with_capacity(cols.len());
+        let identity = self.overlay.columns().is_none();
+        let base: Vec<Cell> = match row.kind {
+            LKind::Src(span) if identity => self.cells(&span, cols.clone(), max_chars)?,
+            LKind::Src(span) => {
+                let mut v = Vec::with_capacity(cols.len());
+                for c in cols.clone() {
+                    v.push(match self.overlay.col_ref(c) {
+                        ColRef::Src(i) => self
+                            .cells(&span, i as usize..i as usize + 1, max_chars)?
+                            .pop()
+                            .unwrap_or_default(),
+                        ColRef::New(_) => Cell::default(),
+                    });
+                }
+                v
+            }
+            LKind::New(_) => cols.clone().map(|_| Cell::default()).collect(),
+        };
+        for (c, cell) in cols.zip(base) {
+            match self.overlay.cell(rref, self.overlay.col_ref(c)) {
+                Some(v) => {
+                    let vis = visible(v);
+                    let (text, cut) = truncate_chars(&vis, max_chars);
+                    out.push((
+                        Cell {
+                            text,
+                            truncated: cut,
+                            raw_len: v.len(),
+                            missing: false,
+                            unknown: false,
+                        },
+                        true,
+                    ));
+                }
+                None => out.push((cell, false)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The full value of a cell (bounded to `max_bytes` for source cells),
+    /// with edits applied.
+    pub fn value(&mut self, row: &LRow, col: usize, max_bytes: usize) -> io::Result<String> {
+        let cref = self.overlay.col_ref(col);
+        if let Some(v) = self.overlay.cell(row.row_ref(), cref) {
+            return Ok(v.to_string());
+        }
+        match (row.kind, cref) {
+            (LKind::Src(span), ColRef::Src(i)) => Ok(self
+                .field_value(&span, i as usize, max_bytes)?
+                .map(|(t, _)| t)
+                .unwrap_or_default()),
+            _ => Ok(String::new()),
+        }
+    }
+
+    /// The source value of a cell (before edits), for "no change" checks.
+    pub fn original(&mut self, row: RowRef, col: ColRef) -> Option<String> {
+        let (RowRef::Src(offset), ColRef::Src(i)) = (row, col) else {
+            return None;
+        };
+        let pos = RowPos {
+            offset,
+            record: 0,
+            exact: false,
+        };
+        let rec = self
+            .locator
+            .records_from(pos, 1)
+            .ok()?
+            .rows
+            .first()
+            .map(|r| r.1)
+            .filter(|r| r.start == offset)?;
+        self.field_value(&rec, i as usize, ROW_PARSE_BUDGET)
+            .ok()
+            .flatten()
+            .map(|(t, _)| t)
+    }
+
+    /// Sets cells given by logical row and column (one undo step).
+    pub fn set_values(&mut self, changes: Vec<(RowRef, usize, String)>) {
+        let mapped: Vec<(RowRef, ColRef, String)> = changes
+            .into_iter()
+            .map(|(r, c, v)| (r, self.overlay.col_ref(c), v))
+            .collect();
+        let mut originals = HashMap::new();
+        for (r, c, _) in &mapped {
+            if let RowRef::Src(_) = r {
+                originals.insert((*r, *c), self.original(*r, *c));
+            }
+        }
+        self.overlay
+            .set_cells(mapped, |r, c| originals.get(&(r, c)).cloned().flatten());
+    }
+
+    /// Display name of logical column `col` (with renames), if the file has
+    /// a header.
+    pub fn column_name(&mut self, col: usize) -> Option<String> {
+        if !self.dialect.has_header {
+            return None;
+        }
+        let header = self.header_record().ok().flatten()?;
+        let cref = self.overlay.col_ref(col);
+        if let Some(v) = self.overlay.cell(RowRef::Src(header.start), cref) {
+            return Some(v.to_string());
+        }
+        match cref {
+            ColRef::Src(i) => self
+                .cells(&header, i as usize..i as usize + 1, 200)
+                .ok()?
+                .pop()
+                .filter(|c| !c.missing && !c.unknown)
+                .map(|c| c.text),
+            ColRef::New(_) => Some(String::new()),
+        }
     }
 
     /// Decoded cells of the first records in the sample (for column widths,

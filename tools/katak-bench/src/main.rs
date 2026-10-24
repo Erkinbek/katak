@@ -24,6 +24,8 @@ struct Args {
     repeat: usize,
     /// Run the search/filter suite (patterns suit the generated big_*.csv).
     suite: bool,
+    /// Measure saving (zero edits and a handful of edits) to a temp file.
+    save: bool,
 }
 
 fn parse_args() -> Args {
@@ -32,6 +34,7 @@ fn parse_args() -> Args {
         access: AccessMode::Auto,
         repeat: 1,
         suite: false,
+        save: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -39,11 +42,12 @@ fn parse_args() -> Args {
             "--buffered" => args.access = AccessMode::Buffered,
             "--repeat" => args.repeat = it.next().and_then(|n| n.parse().ok()).unwrap_or(1),
             "--suite" => args.suite = true,
+            "--save" => args.save = true,
             _ => args.files.push(PathBuf::from(a)),
         }
     }
     if args.files.is_empty() {
-        eprintln!("usage: katak-bench FILE... [--buffered] [--repeat N] [--suite]");
+        eprintln!("usage: katak-bench FILE... [--buffered] [--repeat N] [--suite] [--save]");
         std::process::exit(2);
     }
     args
@@ -67,6 +71,7 @@ fn bench(
     path: &PathBuf,
     access: AccessMode,
     suite: bool,
+    save: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let len = std::fs::metadata(path)?.len();
     println!("\n== {} ({})", path.display(), human_bytes(len));
@@ -159,19 +164,119 @@ fn bench(
     if suite {
         search_suite(&mut doc)?;
     }
+    if save {
+        save_bench(&mut doc, path)?;
+    }
     Ok(())
+}
+
+/// Saves to a temp file next to the input: once without edits (a plain
+/// copy) and once with 5 edited cells, one inserted and one deleted row.
+/// Reports throughput and the peak private memory sampled during the save.
+fn save_bench(doc: &mut Document, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let target = path.with_extension("katak-bench-save.tmp.csv");
+    let len = doc.source().len();
+    for edits in [false, true] {
+        if edits {
+            let total = doc.stats().rows.max(10);
+            let mut seed = 0xDEAD_BEEFu64;
+            for k in 0..5 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let hdr = doc.header_records();
+                if let Ok(p) = doc.locator().locate_record(seed % total + hdr) {
+                    let pos = doc.lpos_of(p);
+                    if let Ok((rows, _)) = doc.lrows_from(pos, 1)
+                        && let Some(r) = rows.first()
+                    {
+                        doc.set_values(vec![(r.row_ref(), 1, format!("edited {k}, \"quoted\""))]);
+                    }
+                }
+            }
+            let first = doc.first_lpos();
+            if let Ok((rows, _)) = doc.lrows_from(first, 3)
+                && let Some(span) = rows.get(2).and_then(|r| r.span())
+            {
+                doc.overlay.insert_rows(span.start, 0, 1);
+                doc.overlay.delete_rows(
+                    &[],
+                    &[katak_core::overlay::Deleted {
+                        start: span.start,
+                        end: span.end,
+                        records: 1,
+                    }],
+                );
+            }
+        }
+        let input = doc.save_input(8);
+        let t = target.clone();
+        let start = Instant::now();
+        let job = katak_core::job::Job::spawn("save", no_notify(), move |ctl| {
+            katak_core::save::save_file(&input, &t, false, ctl)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        let mut peak = private_bytes().unwrap_or(0);
+        while job.is_running() {
+            std::thread::sleep(Duration::from_millis(20));
+            peak = peak.max(private_bytes().unwrap_or(0));
+        }
+        job.join();
+        let took = start.elapsed();
+        if let Some(e) = job.error() {
+            return Err(e.into());
+        }
+        let out_len = std::fs::metadata(&target)?.len();
+        let identical = !edits && files_equal(path, &target)?;
+        println!(
+            "   save {}: {} in {:.0} ms = {:.0} MB/s, peak private memory {}{}",
+            if edits {
+                "with 5 edits + 1 inserted + 1 deleted row"
+            } else {
+                "without edits"
+            },
+            human_bytes(out_len),
+            ms(took),
+            mb_per_s(len, took),
+            human_bytes(peak),
+            if edits {
+                String::new()
+            } else if identical {
+                ", byte-identical".into()
+            } else {
+                ", NOT IDENTICAL".into()
+            }
+        );
+        let _ = std::fs::remove_file(&target);
+    }
+    doc.overlay.clear();
+    Ok(())
+}
+
+fn files_equal(a: &PathBuf, b: &PathBuf) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 8 << 20], vec![0u8; 8 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Search and filter throughput on the generated big_*.csv layout
 /// (id,name,email,amount,date,city,notes).
 fn search_suite(doc: &mut Document) -> Result<(), Box<dyn std::error::Error>> {
-    let target = Target {
-        src: doc.source().clone(),
-        dialect: doc.compiled().clone(),
-        encoding: doc.dialect().encoding,
-        data_start: doc.data_start(),
-        header_records: doc.header_records(),
-    };
+    let target: Target = doc.target();
     let len = doc.source().len();
     let lit = |p: &str| SearchOptions {
         pattern: p.into(),
@@ -276,7 +381,7 @@ fn main() {
     let args = parse_args();
     for _ in 0..args.repeat {
         for f in &args.files {
-            if let Err(e) = bench(f, args.access, args.suite) {
+            if let Err(e) = bench(f, args.access, args.suite, args.save) {
                 eprintln!("{}: {e}", f.display());
             }
         }

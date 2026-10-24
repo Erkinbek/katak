@@ -11,7 +11,7 @@ use regex::Regex;
 
 use crate::chunked::ChunkedVec;
 use crate::encoding::TextEncoding;
-use crate::fields::{split, unquote};
+use crate::fields::split;
 use crate::infer::parse_number;
 use crate::job::{Job, Notify};
 use crate::scan::Flow;
@@ -190,6 +190,12 @@ pub fn start(
             d.records_scanned = records;
             d.capped |= capped;
         };
+        let forced = target.forced();
+        let need = if target.overlay.is_some() {
+            usize::MAX
+        } else {
+            need
+        };
         let res = visit_records(
             &target.src,
             &target.dialect,
@@ -197,20 +203,18 @@ pub fn start(
             0,
             ctl,
             pre.as_ref(),
+            &forced,
             |v| {
-                if v.record < target.header_records {
+                if v.record < target.header_records || target.deleted(v.span.start) {
                     return Flow::Continue;
                 }
                 last_record = v.record;
                 spans.clear();
                 split(&target.dialect, v.content, 0, need, &mut spans);
-                let pass = compiled.iter().all(|c| match spans.get(c.col) {
-                    Some(f) => {
-                        let raw = unquote(&target.dialect, &v.content[f.start..f.end], f.quoted);
-                        c.matches(&target.encoding.decode(&raw))
-                    }
-                    None => c.matches(""),
-                });
+                let values = target.values(v.span.start, v.content, &spans);
+                let pass = compiled
+                    .iter()
+                    .all(|c| c.matches(values.get(c.col).map_or("", |(_, v)| v.as_ref())));
                 if pass {
                     matched += 1;
                     if kept < cap {
@@ -270,6 +274,7 @@ mod tests {
             encoding: d.encoding,
             data_start: 0,
             header_records: 1,
+            overlay: None,
         };
         let f = start(target, filters, 100, no_notify()).unwrap();
         f.job.join();
@@ -347,6 +352,7 @@ mod tests {
             encoding: d.encoding,
             data_start: 0,
             header_records: 1,
+            overlay: None,
         };
         assert!(
             start(

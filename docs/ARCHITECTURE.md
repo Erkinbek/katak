@@ -284,8 +284,12 @@ The grid shows one of:
   bytes (including original quotes), changed fields are encoded with minimal
   quoting, original separators and the record's own terminator are kept.
   Column mapping changes force the per-record path for every record.
-* Write to `.<name>.katak-XXXX.tmp` in the same directory, `fsync`, release
-  our own mapping, then atomically rename over the original. Optional `.bak`
+* Write to `.<name>.XXXX.katak.tmp` in the same directory, `fsync`, then
+  atomically rename over the original with `std::fs::rename`. On Windows
+  it uses POSIX rename semantics, which replace the target even while
+  Katak still has it open and mapped (the old views keep reading the old
+  data); `MoveFileExW` would fail with "access denied". After the rename
+  the document is re-read. Optional `.bak`
   is a hard link to the original (copy if links are unsupported). Any failure
   leaves the original untouched and maps OS errors (sharing violation, access
   denied, read-only, disk full) to clear messages.
